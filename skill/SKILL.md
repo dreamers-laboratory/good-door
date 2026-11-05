@@ -11,7 +11,7 @@ You use credentials. You never see them.
 
 - Find names with `elbab list`. Use a value with `elbab run ENTRY -- CMD`.
 - Never print, echo, log or write a value, or pass one as an argument. `elbab get` and `elbab print` only when piped straight into the command that needs it.
-- Never read `*.age` files, the machine identity or private key files. Never use `--reveal`, `--show` or `--dump`, and never run elbab in a terminal the user shares with you: `show` and `csv query` print secrets there. In your own shell they print masked.
+- Never read `*.age` files, the machine identity or private key files. Never use `--reveal`, `--show` or `--dump`, and never run elbab in a terminal the user shares with you: `show` and `csv query` print secrets there. In your own shell they print masked; if they don't, stop and tell the user.
 - To store a new secret, ask the user to run `elbab set-key ENTRY VAR` or `elbab NAME` in their own terminal. Don't type it yourself.
 - Run `elbab verify` after any change to the store.
 
