@@ -37,7 +37,9 @@ No prompts unless you set the hardware or password manager to ask.
 ```sh
 elbab set-key openai OPENAI_API_KEY      # prompts; never in shell history (--hidden: no echo)
 elbab run openai -- python app.py        # value in the environment, never in a file
-elbab get openai OPENAI_API_KEY --copy   # clipboard, cleared after 30 s
+elbab print openai                      # all saved fields as JSON
+elbab print openai OPENAI_API_KEY        # one value
+elbab print openai OPENAI_API_KEY --copy # clipboard, cleared after 30 s
 elbab github.com                         # a password; "user / password" stores both
 elbab tmp wifi 2h                        # expires
 elbab list                               # names only
@@ -46,6 +48,11 @@ elbab show keys.json                     # every value, on your own terminal
 
 `show` and `csv query` print secrets only to your terminal. Pipes and agent shells (`CLAUDECODE`, `AI_AGENT`,
 `CODEX_THREAD_ID`, `CODEX_SHELL` or `CODEX_SANDBOX` set) get them masked; `--mask` masks them on screen too.
+
+`print ENTRY` outputs every saved credential field; add a field name for just its value.
+`--copy` works with either form. Existing file and folder paths still print their contents;
+use `./NAME` for an explicit relative path. `get` remains a compatibility alias for entry values.
+Like `get`, `print` writes secrets directly: agents should use `run`, or pipe directly into the consuming command.
 
 `elbab --help` lists the rest.
 

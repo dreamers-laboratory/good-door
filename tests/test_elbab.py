@@ -207,6 +207,25 @@ class StoreTest(Base):
         self.assertNotIn("ann", self.e("csv", "query", "-a", "hunter2").stdout)
         self.assertEqual(self.e("csv", "get", "1", "password").stdout, "hunter2pass")
 
+    def test_2b_print_entries(self):
+        self.e("save", "print.login", stdin="alice / dummy-print-password")
+        credentials = {"USERNAME": "alice", "PASSWORD": "dummy-print-password"}
+        self.assertEqual(json.loads(self.e("print", "print.login").stdout), credentials)
+        self.assertEqual(self.e("print", "print.login", "PASSWORD").stdout, credentials["PASSWORD"])
+        self.assertEqual(json.loads(self.e("get", "print.login").stdout), credentials)
+        self.assertEqual(self.e("get", "print.login", "PASSWORD").stdout, credentials["PASSWORD"])
+        missing = self.e("print", "print.login", "MISSING", ok=False)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertNotIn(credentials["PASSWORD"], missing.stderr)
+        self.assertNotEqual(self.e("print", "unknown.entry", ok=False).returncode, 0)
+        work = self.base / "print-work"
+        work.mkdir()
+        (work / "print.login").write_text("file contents")
+        out = subprocess.run([sys.executable, "-I", str(ELBAB), "print", "print.login"],
+                             env=self.env, cwd=work, capture_output=True, text=True)
+        self.assertEqual((out.returncode, out.stdout), (0, "file contents"))
+        self.assertNotEqual(self.e("print", str(work / "print.login"), "--copy", ok=False).returncode, 0)
+
     def test_3_writes(self):
         self.e("csv", "upsert", stdin=json.dumps({"record_id": "2", "service": "New", "password": "pw2"}))
         self.e("csv", "upsert", stdin=json.dumps({"record_id": "1", "notes": "changed"}))

@@ -10,7 +10,8 @@ for a password. Decrypted data stays in memory, except `cat`, which streams to s
   elbab recipients [add AGE1... --name N]      machines and recovery keys that can decrypt; then rekey
   elbab list                                   entry names and scopes (no decryption)
   elbab run ENTRY [--] CMD...                  run CMD with ENTRY's variables in its environment
-  elbab get ENTRY VAR [--copy]                 one value (stdout, or clipboard for 30 s)
+  elbab print ENTRY [FIELD] [--copy]           one value, or all saved fields as JSON
+  elbab get ENTRY [FIELD] [--copy]             compatibility alias for entry values
   elbab set-key ENTRY VAR [--scope S]          store a value (visible prompt or stdin; --hidden)
   elbab NAME | save NAME                       store a password; "user / password" stores both (--hidden)
   elbab tmp NAME DURATION                      an expiring password (12d, 2h, 1h30m)
@@ -711,6 +712,9 @@ def cmd_run(a):
 
 def cmd_get(a):
     entry = load_keys()["entries"].get(a.entry) or die("unknown or expired entry; see elbab list")
+    if a.var is None:
+        emit(json.dumps(entry["credentials"], indent=2, ensure_ascii=False), a.copy)
+        return
     if a.var not in entry["credentials"]:
         die(f"{a.entry} has no {a.var}; it has {', '.join(entry['credentials'])}")
     emit(entry["credentials"][a.var], a.copy)
@@ -1856,6 +1860,12 @@ def cmd_decrypt(a):
 
 
 def cmd_print(a):
+    if a.var is not None or not ("/" in a.path or "\\" in a.path or a.path.startswith((".", "~"))
+                                  or os.path.lexists(os.path.expanduser(a.path))):
+        a.entry = a.path
+        return cmd_get(a)
+    if a.copy:
+        die("--copy applies to entries, not files or folders")
     p = target(a.path)
     if is_encrypted(p):
         payload = age_decrypt(p)
@@ -2243,7 +2253,8 @@ def main():
         (["recipient"], {"nargs": "?"}), (["--name"], {}))
     cmd("list", cmd_list)
     cmd("run", cmd_run, (["entry"], {}), (["command"], {"nargs": argparse.REMAINDER}))
-    cmd("get", cmd_get, (["entry"], {}), (["var"], {}), copy)
+    cmd("get", cmd_get, (["entry"], {}), (["var"], {"nargs": "?"}), copy,
+        help="compatibility alias for print ENTRY [FIELD]")
     shown(cmd("show", cmd_show, (["file"], {}), (["path"], {"nargs": "?"})))
     cmd("field", cmd_field, (["file"], {}), (["path"], {}), copy)
     cmd("set", cmd_set, (["file"], {}), (["path"], {}), (["--json"], {"action": "store_true", "help": "parse the value as JSON"}), hidden)
@@ -2280,7 +2291,8 @@ def main():
         cmd(verb, fn, (["path"], {}), (["-o", "--output"], {"metavar": "OUT", "help": f"write {what} to OUT (must not exist) "
                                                               "instead of working in place"}),
             help=f"{verb} a file or folder in place, or to OUT")
-    cmd("print", cmd_print, (["path"], {}), help="decrypted contents to stdout; a folder prints every file, in order")
+    cmd("print", cmd_print, (["path"], {"metavar": "ENTRY_OR_PATH"}), (["var"], {"nargs": "?", "metavar": "FIELD"}), copy,
+        help="one entry field, all fields as JSON, or file/folder contents")
     cmd("migrate", cmd_migrate, (["--dry-run"], {"action": "store_true"}))
     cmd("purge-plaintext", cmd_purge)
     cmd("rekey", cmd_rekey)
