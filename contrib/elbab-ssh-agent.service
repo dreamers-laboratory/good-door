@@ -1,0 +1,16 @@
+# ssh-agent with elbab-protected keys loaded at boot, no login needed (with `loginctl enable-linger`).
+#   cp elbab-ssh-agent.service ~/.config/systemd/user/ && systemctl --user enable --now elbab-ssh-agent
+#   ~/.ssh/config:  Host *
+#                     IdentityAgent /run/user/%i/elbab-ssh-agent.sock
+[Unit]
+Description=ssh-agent with elbab keys
+
+[Service]
+ExecStartPre=/bin/rm -f %t/elbab-ssh-agent.sock
+ExecStart=/usr/bin/ssh-agent -D -a %t/elbab-ssh-agent.sock
+ExecStartPost=-/usr/bin/env SSH_AUTH_SOCK=%t/elbab-ssh-agent.sock python3 -I %h/.local/bin/elbab ssh-load
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

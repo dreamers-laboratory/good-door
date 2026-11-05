@@ -1,0 +1,2312 @@
+#!/usr/bin/env -S python3 -I
+"""elbab: an age-encrypted credential store that opens without prompts on machines you trust.
+
+Every file in the store (~/.elbab, or $ELBAB_HOME) is <name>.age, encrypted to each key in
+recipients.txt. This machine's private age identity lives in the OS secret store (macOS
+Keychain or Secure Enclave, a Linux TPM or Secret Service, Windows DPAPI), so nothing asks
+for a password. Decrypted data stays in memory, except `cat`, which streams to stdout.
+
+  elbab init [--backend B] [--recovery FILE]   set up this machine (and a store, unless --join)
+  elbab recipients [add AGE1... --name N]      machines and recovery keys that can decrypt; then rekey
+  elbab list                                   entry names and scopes (no decryption)
+  elbab run ENTRY [--] CMD...                  run CMD with ENTRY's variables in its environment
+  elbab get ENTRY VAR [--copy]                 one value (stdout, or clipboard for 30 s)
+  elbab set-key ENTRY VAR [--scope S]          store a value (visible prompt or stdin; --hidden)
+  elbab NAME | save NAME                       store a password; "user / password" stores both (--hidden)
+  elbab tmp NAME DURATION                      an expiring password (12d, 2h, 1h30m)
+  elbab import-env ENTRY FILE                  every KEY=VALUE of a .env file into ENTRY
+  elbab show FILE [PATH] [--mask|--reveal]     pretty-print a store file; secrets shown on your terminal,
+                                               masked when piped or run by an agent
+  elbab field FILE PATH [--copy] | set FILE PATH   one JSON a/b/c value or CSV record_id/column
+  elbab csv query|get|upsert|columns           the logins.csv table
+  elbab cat FILE | put FILE                    raw bytes out / in
+  elbab encrypt PATH [-o OUT]                  a file or folder becomes one age file in place (or OUT)
+  elbab decrypt PATH [-o OUT] | print PATH     back in place (or to OUT, PATH stays encrypted) / contents to stdout
+  elbab run PATH [--] CMD...                   run CMD with PATH decrypted in place; encrypted again when it exits
+  elbab ssh-protect KEY... | ssh-load [KEY...] | ssh-pass KEY | pubkeys [--list] [NAME]
+  elbab aws-protect FILE... | aws FILE PROFILE keyless ~/.aws files; credential_process helper
+  elbab guard TOOL [ARGS] | guard-seal TOOL | guard-add NAME ... | shims
+                                               CLI logins (gcloud, az, any) decrypted only while the CLI runs
+  elbab scan PATH...                           list secret-shaped files (names only)
+  elbab verify | migrate | purge-plaintext | rekey
+  elbab --show | --dump [FILE|DIR]             owner only, asks for your OS password: export everything
+"""
+import argparse
+import base64
+import configparser
+import contextlib
+import csv
+import getpass
+import hashlib
+import io
+import json
+import os
+import platform
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import zipfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+    import pwd
+
+SUDO = not WINDOWS and os.geteuid() == 0 and bool(os.environ.get("SUDO_UID"))  # elbab drops root at startup
+if WINDOWS:
+    USER_NAME, REAL_HOME = getpass.getuser(), Path.home()
+else:  # from the account, not $HOME, so tools that change HOME still reach the store
+    _pw = pwd.getpwuid(int(os.environ["SUDO_UID"]) if SUDO else os.getuid())
+    USER_NAME, REAL_HOME = _pw.pw_name, Path(_pw.pw_dir)
+HOME = Path(os.environ.get("ELBAB_USER_HOME") or REAL_HOME)  # ELBAB_USER_HOME: tests only
+ROOT = Path(os.environ.get("ELBAB_HOME") or REAL_HOME / ".elbab").resolve()
+if os.environ.get("ELBAB_CONFIG"):
+    CONFIG_DIR = Path(os.environ["ELBAB_CONFIG"])
+elif WINDOWS:
+    CONFIG_DIR = Path(os.environ.get("APPDATA") or REAL_HOME / "AppData/Roaming") / "elbab"
+else:
+    CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or REAL_HOME / ".config") / "elbab"
+CONFIG = CONFIG_DIR / "config.json"  # per machine: where this machine's identity lives
+RECIPIENTS = ROOT / "recipients.txt"
+INDEX = ROOT / "index.json"
+BACKUPS = ROOT / "backups"
+GUARDS_FILE = ROOT / "guards.json"
+SHIMS = ROOT / "shims"
+KEYS, CREDS = "keys.json", "logins.csv"
+CREDS_FIELDS = ["record_id", "service", "url", "username", "password", "notes"]
+KEYCHAIN_SERVICE = "elbab-age-identity"
+TPM_CRED_NAME = "elbab-age"
+# Files that stay plaintext: public metadata and shims. Everything else is encrypted.
+PLAINTEXT_OK = {"recipients.txt", "index.json", "guards.json", ".keys.lock", ".gitignore", "README.md"}
+SKIP_DIRS = {"__pycache__"}
+HOST = re.sub(r"[^a-z0-9-]+", "-", platform.node().split(".")[0].lower()).strip("-") or "host"
+SSH_PASS = f"ssh/passphrases-{HOST}.json"
+SSH_INDEX = ROOT / f"ssh/keys-{HOST}.txt"  # plaintext: paths of protected keys, for pubkeys
+AWS_DIR = HOME / ".aws"
+AWS_SECRET_FIELDS = ("aws_access_key_id", "aws_secret_access_key", "aws_session_token")
+ME = Path(__file__).resolve()
+
+
+def plaintext_ok(rel):
+    return rel in PLAINTEXT_OK or rel.startswith("shims/") or \
+        re.fullmatch(r"ssh/keys-[a-z0-9-]+\.txt|encrypted-[a-z0-9-]+\.txt", rel) is not None
+
+
+SECRET_KEY = re.compile(r"pass(word|phrase|code)?$|secret|token|_?key$|api_?key|private|answer|^pin$|cookie|session", re.I)
+SECRET_VALUE = re.compile("|".join([
+    r"sk-[A-Za-z0-9_-]{16,}", r"\bAKIA[0-9A-Z]{16}\b", r"AGE-SECRET-KEY-1[0-9A-Z]{50,}",
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----", r"\bxox[abprs]-[A-Za-z0-9-]{10,}",
+    r"\bgh[pousr]_[A-Za-z0-9]{30,}", r"\bgithub_pat_[A-Za-z0-9_]{30,}", r"\b[A-Za-z0-9_+=-]{40,}",
+]))
+MASK = "••••"
+COPY_CLEAR_SECONDS = 30
+
+
+def die(msg, code=2):
+    print(f"elbab: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def secret_column(name):
+    return name == "password" or bool(SECRET_KEY.search(name))
+
+
+def path_key(p):
+    """An absolute path as a store path: /home/me/x -> home/me/x, C:\\Users\\me\\x -> C/Users/me/x."""
+    return Path(p).as_posix().replace(":", "").lstrip("/")
+
+
+def write_private(path, data):
+    """Atomic replace, mode 600."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".elbab.", suffix=".tmp")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+# ---------- identity backends: where this machine's age key lives ----------
+
+def tool(name):
+    found = shutil.which(name) or next((p for p in (f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}",
+                                                    f"/usr/bin/{name}") if os.access(p, os.X_OK)), None)
+    if not found:
+        die(f"{name} is not installed")
+    return found
+
+
+def check_private(path, mode):
+    if WINDOWS:  # NTFS ACLs, not mode bits; the profile folders are private by default
+        return
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & ~mode:
+        die(f"{path} has unsafe ownership or permissions")
+
+
+def load_config():
+    return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+
+
+def keychain_path():
+    return str(REAL_HOME / "Library/Keychains/login.keychain-db")
+
+
+def keychain_store(cfg, ident):
+    if '"' in USER_NAME:
+        die("account names with quotes are not supported")
+    # security -i reads the command from stdin, so the key never appears in a process listing
+    line = (f'add-generic-password -a "{USER_NAME}" -s "{cfg["service"]}" -l "elbab age identity" '
+            f'-T /usr/bin/security -w "{ident.decode().strip()}" "{keychain_path()}"\n')
+    r = subprocess.run(["/usr/bin/security", "-i"], input=line.encode(), capture_output=True)
+    if r.returncode:
+        die("could not store the identity in the login Keychain")
+
+
+def keychain_load(cfg):
+    r = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", USER_NAME, "-s", cfg["service"], "-w",
+                        keychain_path()], capture_output=True)
+    if r.returncode:
+        die(f"no identity in the login Keychain (service {cfg['service']})")
+    return r.stdout
+
+
+def tpm_cache(cfg):
+    run = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    return run / f"elbab-identity-{hashlib.sha256(cfg['path'].encode()).hexdigest()[:12]}" if run.is_dir() else None
+
+
+def tpm_store(cfg, ident):
+    r = subprocess.run(["systemd-creds", "--user", "encrypt", f"--name={TPM_CRED_NAME}", "-", cfg["path"]],
+                       input=ident, capture_output=True)
+    if r.returncode:
+        die(f"systemd-creds could not seal the identity: {r.stderr.decode(errors='replace').strip()}")
+    os.chmod(cfg["path"], 0o600)
+
+
+def tpm_load(cfg):
+    cache = tpm_cache(cfg)  # RAM only: unsealed once per boot
+    if cache and cache.exists():
+        check_private(cache, 0o600)
+        return cache.read_bytes()
+    if not Path(cfg["path"]).exists():
+        die(f"no sealed identity at {cfg['path']}")
+    r = subprocess.run(["systemd-creds", "--user", "decrypt", f"--name={TPM_CRED_NAME}", cfg["path"], "-"],
+                       capture_output=True)
+    if r.returncode:
+        die("could not unseal the identity with the TPM")
+    if cache:
+        write_private(cache, r.stdout)
+    return r.stdout
+
+
+def secret_service_store(cfg, ident):
+    r = subprocess.run(["secret-tool", "store", "--label=elbab age identity", "service", cfg["service"],
+                        "account", USER_NAME], input=ident, capture_output=True)
+    if r.returncode:
+        die("secret-tool could not store the identity; is a keyring unlocked?")
+
+
+def secret_service_load(cfg):
+    r = subprocess.run(["secret-tool", "lookup", "service", cfg["service"], "account", USER_NAME], capture_output=True)
+    if r.returncode or not r.stdout:
+        die("no identity in the Secret Service keyring")
+    return r.stdout
+
+
+def dpapi(data, protect):
+    """Windows Data Protection API, current-user scope: only this Windows account on this machine can unprotect."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32, kernel32 = ctypes.WinDLL("crypt32"), ctypes.WinDLL("kernel32")
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    fn.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                   wintypes.DWORD, ctypes.POINTER(Blob)]
+    fn.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, out = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), Blob()
+    if not fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(out)):  # CRYPTPROTECT_UI_FORBIDDEN
+        die("DPAPI could not " + ("protect" if protect else "unprotect") + " the identity")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
+def file_store(cfg, ident):
+    write_private(Path(cfg["path"]), ident)
+
+
+def file_load(cfg):
+    path = Path(cfg["path"]).expanduser()
+    if not path.exists():
+        die(f"no identity file at {path}")
+    check_private(path, 0o600)
+    return path.read_bytes()
+
+
+def command_load(cfg):
+    r = subprocess.run(cfg["command"], capture_output=True)
+    if r.returncode:
+        die(f"identity command failed: {r.stderr.decode(errors='replace').strip()}")
+    return r.stdout
+
+
+BACKENDS = {  # name: (store, load); secure-enclave and file keep an identity file, command only reads
+    "keychain": (keychain_store, keychain_load),
+    "secure-enclave": (file_store, file_load),
+    "tpm": (tpm_store, tpm_load),
+    "secret-service": (secret_service_store, secret_service_load),
+    "dpapi": (lambda cfg, ident: write_private(Path(cfg["path"]), dpapi(ident, True)),
+              lambda cfg: dpapi(Path(cfg["path"]).read_bytes(), False)),
+    "file": (file_store, file_load),
+    "command": (None, command_load),
+}
+
+
+def identity_exists(cfg):
+    """Whether the backend already holds an identity; init never replaces one."""
+    if cfg["backend"] == "keychain":
+        return subprocess.run(["/usr/bin/security", "find-generic-password", "-a", USER_NAME, "-s", cfg["service"],
+                               keychain_path()], capture_output=True).returncode == 0
+    if cfg["backend"] == "secret-service":
+        return bool(subprocess.run(["secret-tool", "lookup", "service", cfg["service"], "account", USER_NAME],
+                                   capture_output=True).stdout)
+    return "path" in cfg and Path(cfg["path"]).exists()
+
+
+def default_backend():
+    if sys.platform == "darwin":
+        return "keychain"
+    if WINDOWS:
+        return "dpapi"
+    if shutil.which("systemd-creds") and subprocess.run(["systemd-creds", "has-tpm2"], capture_output=True).returncode == 0:
+        return "tpm"
+    if shutil.which("secret-tool") and os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return "secret-service"
+    die("no TPM or Secret Service found; choose --backend file, --identity-file PATH or --command CMD")
+
+
+def backend_config(name, a):
+    cfg = {"backend": name}
+    if name in ("keychain", "secret-service"):
+        cfg["service"] = a.service
+    elif name == "tpm":
+        cfg["path"] = str(CONFIG_DIR / "identity.cred")
+    elif name == "dpapi":
+        cfg["path"] = str(CONFIG_DIR / "identity.dpapi")
+    elif name == "secure-enclave":
+        cfg["path"] = str(CONFIG_DIR / "identity-se.txt")
+    elif name == "file":
+        cfg["path"] = str(Path(a.identity_file).expanduser().absolute()) if a.identity_file else str(CONFIG_DIR / "identity.txt")
+    elif name == "command":
+        cfg["command"] = shlex.split(a.command or die("--backend command needs --command CMD"))
+    return cfg
+
+
+_IDENTITY = None
+
+
+def identity():
+    global _IDENTITY
+    if _IDENTITY:
+        return _IDENTITY
+    if os.environ.get("ELBAB_IDENTITY_FILE"):  # tests and one-off recovery
+        raw = Path(os.environ["ELBAB_IDENTITY_FILE"]).read_bytes()
+    else:
+        cfg = load_config().get("identity") or die(f"this machine is not set up; run elbab init (config: {CONFIG})")
+        raw = BACKENDS.get(cfg["backend"], (None, None))[1] or die(f"unknown backend {cfg['backend']}")
+        raw = raw(cfg)
+    _IDENTITY = key_lines(raw)
+    if _IDENTITY == b"\n":
+        die("the stored identity is not an age identity")
+    return _IDENTITY
+
+
+def recipient_of(ident):
+    """The public recipient for an identity, or None: key files carry it in a comment; plain keys derive it."""
+    m = re.search(rb"(?im)^#\s*(?:public key|recipient):\s*(age1[0-9a-z]+)", ident)
+    if m:
+        return m.group(1).decode()
+    r = subprocess.run([tool("age-keygen"), "-y"], input=ident, capture_output=True)
+    return r.stdout.decode().strip() or None if r.returncode == 0 else None
+
+
+def key_lines(ident):
+    return b"\n".join(l.strip() for l in ident.splitlines() if l.strip().startswith((b"AGE-SECRET-KEY-1", b"AGE-PLUGIN-"))) + b"\n"
+
+
+def age_decrypt(path):
+    r = subprocess.run([tool("age"), "-d", "-i", "-", str(path)], input=identity(), capture_output=True)
+    if r.returncode:
+        die(f"cannot decrypt {path.name}: {r.stderr.decode(errors='replace').strip()}")
+    return r.stdout
+
+
+def age_encrypt(data):
+    if not RECIPIENTS.exists():
+        die(f"no store at {ROOT}; run elbab init")
+    r = subprocess.run([tool("age"), "-R", str(RECIPIENTS)], input=data, capture_output=True)
+    if r.returncode:
+        die(f"encryption failed: {r.stderr.decode(errors='replace').strip()}")
+    return r.stdout
+
+
+# ---------- locks ----------
+
+@contextlib.contextmanager
+def file_lock(path):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        check_private(path, 0o600)
+        if WINDOWS:
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if WINDOWS:
+            with contextlib.suppress(OSError):
+                os.lseek(fd, 0, 0)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        os.close(fd)
+
+
+_KEYS_LOCKED = False
+
+
+@contextlib.contextmanager
+def keys_lock():
+    global _KEYS_LOCKED
+    if _KEYS_LOCKED:
+        yield
+        return
+    with file_lock(ROOT / ".keys.lock"):
+        _KEYS_LOCKED = True
+        try:
+            yield
+        finally:
+            _KEYS_LOCKED = False
+
+
+# ---------- files ----------
+
+def entry_active(entry, now=None):
+    if not isinstance(entry, dict) or not entry.get("temporary"):
+        return True
+    try:
+        created = datetime.fromisoformat(entry["created_at"])
+        expires = datetime.fromisoformat(entry["expires_at"])
+        if created.utcoffset() is None or expires.utcoffset() is None:
+            return False
+        return created <= (now or datetime.now(timezone.utc)) < expires
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def visible_keys(keys):
+    now = datetime.now(timezone.utc)
+    return {**keys, "entries": {name: entry for name, entry in keys["entries"].items()
+                                if entry_active(entry, now)}}
+
+
+def filter_temporary(data, registry=False):
+    # Enforce expiry on raw reads and on old versions in backups/, not just get/run.
+    if not registry and b'"elbab_temporary_credentials"' not in data:
+        return data
+    try:
+        obj = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        return data
+    if isinstance(obj, dict) and isinstance(obj.get("entries"), dict):
+        if registry or obj.get("elbab_temporary_credentials") == 1:
+            return (json.dumps(visible_keys(obj), indent=2) + "\n").encode()
+    return data
+
+
+def resolve(rel):
+    rel = str(rel).removesuffix(".age")
+    path = (ROOT / rel).resolve()
+    if ROOT not in path.parents:
+        die(f"{rel} is outside the store")
+    return path, path.with_name(path.name + ".age")
+
+
+def stored(rel):
+    return resolve(rel)[1].exists()
+
+
+def read(rel):
+    plain, enc = resolve(rel)
+    if enc.exists():
+        return filter_temporary(age_decrypt(enc), registry=plain == ROOT / KEYS)
+    if plain.exists():
+        die(f"{rel} is still plaintext; run elbab migrate")
+    die(f"{rel} does not exist")
+
+
+def write(rel, data):
+    with keys_lock() if resolve(rel)[0] == ROOT / KEYS else contextlib.nullcontext():
+        _write(rel, data)
+
+
+def _write(rel, data):
+    """Encrypt and atomically replace rel; the previous version is kept, encrypted, in backups/."""
+    plain, enc = resolve(rel)
+    blob = age_encrypt(data)
+    if enc.exists():
+        BACKUPS.mkdir(mode=0o700, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+        shutil.copy2(enc, BACKUPS / f"{plain.relative_to(ROOT).as_posix().replace('/', '__')}.{stamp}.age")
+    write_private(enc, blob)
+    if age_decrypt(enc) != data:
+        die(f"read-back check failed for {rel}")
+    if plain == ROOT / KEYS:
+        write_index(json.loads(data))
+
+
+def write_index(keys):
+    index = {name: ({k: entry.get(k) for k in ("scope", "temporary", "created_at", "expires_at")}
+                    if entry.get("temporary") else entry.get("scope", ""))
+             for name, entry in keys["entries"].items() if entry_active(entry)}
+    write_private(INDEX, (json.dumps(index, indent=1) + "\n").encode())
+
+
+def load_keys():
+    return json.loads(read(KEYS)) if stored(KEYS) or (ROOT / KEYS).exists() else {"entries": {}}
+
+
+def save_keys(keys):
+    keys["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    write(KEYS, (json.dumps(keys, indent=2) + "\n").encode())
+
+
+def load_csv():
+    if not stored(CREDS) and not (ROOT / CREDS).exists():
+        return list(CREDS_FIELDS), []
+    reader = csv.DictReader(io.StringIO(read(CREDS).decode("utf-8-sig"), newline=""))
+    return reader.fieldnames, list(reader)
+
+
+def dump_csv(fields, rows):
+    out = io.StringIO(newline="")
+    w = csv.DictWriter(out, fieldnames=fields, lineterminator="\n")
+    w.writeheader()
+    w.writerows(rows)
+    return out.getvalue().encode()
+
+
+# ---------- masking, paths, clipboard ----------
+
+AGENT_ENV = ("CLAUDECODE", "AI_AGENT", "CODEX_THREAD_ID", "CODEX_SHELL", "CODEX_SANDBOX")
+
+
+def reveal(a):
+    """show and csv query print secrets to a person's terminal. Pipes, captured output and
+    agent shells (which set one of AGENT_ENV) get them masked. --mask and --reveal force it."""
+    if a.reveal or a.mask:
+        return a.reveal
+    return sys.stdout.isatty() and not any(os.environ.get(v) for v in AGENT_ENV)
+
+
+def mask_text(s):
+    return SECRET_VALUE.sub(MASK, s) if isinstance(s, str) else s
+
+
+def mask(obj, secret=False):
+    if isinstance(obj, dict):
+        return {k: mask(v, secret or bool(SECRET_KEY.search(str(k)))) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [mask(v, secret) for v in obj]
+    if secret and obj not in (None, ""):
+        return MASK
+    return mask_text(obj)
+
+
+def walk(obj, path):
+    for part in [p for p in path.split("/") if p]:
+        if isinstance(obj, list) and part.isdigit() and int(part) < len(obj):
+            obj = obj[int(part)]
+        elif isinstance(obj, dict) and part in obj:
+            obj = obj[part]
+        else:
+            die(f"no such path: {path}")
+    return obj
+
+
+def clipboard():
+    """(copy command, paste command, clear command)."""
+    if sys.platform == "darwin":
+        return ["pbcopy"], ["pbpaste"], ["pbcopy"]
+    if WINDOWS:
+        return ["clip"], ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"], ["clip"]
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        return ["wl-copy"], ["wl-paste", "-n"], ["wl-copy", "--clear"]
+    if shutil.which("xclip"):
+        x = ["xclip", "-selection", "clipboard"]
+        return x, x + ["-o"], x
+    die("--copy needs pbcopy, clip, wl-copy or xclip; pipe the value instead")
+
+
+def emit(value, copy):
+    value = value if isinstance(value, str) else json.dumps(value)
+    if not copy:
+        sys.stdout.write(value + ("\n" if sys.stdout.isatty() else ""))
+        return
+    put, paste, clear = clipboard()
+    subprocess.run(put, input=b"\xff\xfe" + value.encode("utf-16-le") if WINDOWS else value.encode(), check=True)
+    digest = hashlib.sha256(value.encode()).hexdigest()
+    script = ("import hashlib,json,subprocess,sys,time; time.sleep(%d); a=json.loads(sys.argv[1]); "
+              "v=subprocess.run(a['paste'],capture_output=True).stdout.decode(errors='replace').rstrip('\\r\\n'); "
+              "hashlib.sha256(v.encode()).hexdigest()==a['digest'] and subprocess.run(a['clear'],input=b'')") % COPY_CLEAR_SECONDS
+    subprocess.Popen([sys.executable, "-I", "-c", script, json.dumps({"paste": paste, "clear": clear, "digest": digest})],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     **({} if WINDOWS else {"start_new_session": True}))
+    print(f"copied to the clipboard; cleared in {COPY_CLEAR_SECONDS} s", file=sys.stderr)
+
+
+def read_secret(name, hidden=False):
+    """A person at a terminal sees what they type; the value never reaches shell history.
+    --hidden switches to a no-echo prompt. Piped stdin is read as is."""
+    if sys.stdin.isatty():
+        prompt = f"Value for {name} ({'hidden' if hidden else 'visible; not shell history'}): "
+        try:
+            value = getpass.getpass(prompt) if hidden else input(prompt)
+        except EOFError:
+            die("empty value; nothing changed")
+    else:
+        value = sys.stdin.read()
+    value = value.strip("\r\n")
+    if not value:
+        die("empty value; nothing changed")
+    return value
+
+
+# ---------- setup ----------
+
+def cmd_init(a):
+    if load_config().get("identity"):
+        die(f"this machine is already set up ({CONFIG}); its recipient: {recipient_of(identity()) or 'see recipients.txt'}")
+    name = a.backend or ("file" if a.identity_file else "command" if a.command else default_backend())
+    cfg = backend_config(name, a)
+    store = BACKENDS[name][0]
+    if name == "command" or (name == "file" and a.identity_file):  # an identity that already exists
+        ident = command_load(cfg) if name == "command" else file_load(cfg)
+    else:
+        if identity_exists(cfg):
+            die(f"an identity already exists in the {name} backend; elbab never replaces one "
+                "(for a second store on this machine, pass --service NAME or another --backend)")
+        if name == "secure-enclave":
+            r = subprocess.run([tool("age-plugin-se"), "keygen", "--access-control", a.access_control], capture_output=True)
+        else:
+            r = subprocess.run([tool("age-keygen")], capture_output=True)
+        if r.returncode:
+            die(f"key generation failed: {r.stderr.decode(errors='replace').strip()}")
+        ident = r.stdout
+        CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        store(cfg, ident if store is file_store else key_lines(ident))  # key stores get the secret line only
+    recipient = recipient_of(ident) or die("could not derive this identity's recipient")
+    write_private(CONFIG, (json.dumps({"identity": cfg}, indent=2) + "\n").encode())
+    global _IDENTITY
+    _IDENTITY = None
+    if identity().strip() not in ident:
+        CONFIG.unlink()
+        die("the identity did not read back from the backend; nothing set up")
+    if name == "file" and b"AGE-SECRET-KEY-1" in ident:
+        print("warning: the identity is a plain file; anyone who can read it can decrypt the store", file=sys.stderr)
+    print(f"identity: {name} backend; recipient {recipient}")
+    if a.join or RECIPIENTS.exists():
+        if RECIPIENTS.exists() and recipient in recipient_lines():
+            print(f"this machine can already decrypt {ROOT}")
+            return
+        print("on a machine that can decrypt the store, run:\n"
+              f"  elbab recipients add {recipient} --name {HOST}\n  elbab rekey\n"
+              f"then copy its store ({ROOT}) here")
+        return
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lines = f"# {HOST} ({name})\n{recipient}\n"
+    if a.recovery:
+        r = subprocess.run([tool("age-keygen")], capture_output=True, check=True)
+        try:
+            fd = os.open(Path(a.recovery).expanduser(), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            die(f"{a.recovery} already exists")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(r.stdout)
+        lines += f"# recovery key (keep it offline)\n{recipient_of(r.stdout)}\n"
+    RECIPIENTS.write_text(lines)
+    save_keys({"entries": {}})
+    print(f"store: {ROOT}" + (f"\nrecovery key: {a.recovery} (move it offline, then delete it here)" if a.recovery else ""))
+
+
+def recipient_lines():
+    return [l.strip() for l in RECIPIENTS.read_text().splitlines() if l.strip() and not l.startswith("#")] \
+        if RECIPIENTS.exists() else []
+
+
+def cmd_recipients(a):
+    if a.action == "add":
+        if not a.recipient or not re.fullmatch(r"age1[0-9a-z]+", a.recipient):
+            die("give an age recipient (age1...)")
+        if a.recipient in recipient_lines():
+            die("already a recipient")
+        with RECIPIENTS.open("a") as fh:
+            fh.write(f"# {a.name or 'added ' + datetime.now().strftime('%Y-%m-%d')}\n{a.recipient}\n")
+        print("added; run elbab rekey so existing files open for it too")
+    else:
+        print(RECIPIENTS.read_text() if RECIPIENTS.exists() else "", end="")
+
+
+# ---------- commands ----------
+
+def cmd_list(a):
+    index = json.loads(INDEX.read_text()) if INDEX.exists() else {
+        n: e.get("scope", "") for n, e in load_keys()["entries"].items()}
+    for name, scope in index.items():
+        if isinstance(scope, dict):
+            if not entry_active(scope):
+                continue
+            scope = f"{scope.get('scope', '')} [expires {scope['expires_at']}]"
+        print(f"{name}: {scope}")
+
+
+def cmd_run(a):
+    command = a.command[1:] if a.command[:1] == ["--"] else a.command
+    if not command:
+        die("give a command after the entry name or path")
+    if "/" in a.entry or "\\" in a.entry or a.entry.startswith((".", "~")):  # a file or folder, not an entry name
+        path_run(target(a.entry), command)
+    entries = load_keys()["entries"]
+    if a.entry not in entries:
+        die("unknown or expired entry; see elbab list (for a file or folder, give a path such as ./NAME)")
+    env = {**os.environ, **entries[a.entry]["credentials"]}
+    if WINDOWS:  # no exec on Windows; keep the exit code
+        sys.exit(subprocess.run(command, env=env).returncode)
+    os.execvpe(command[0], command, env)
+
+
+def cmd_get(a):
+    entry = load_keys()["entries"].get(a.entry) or die("unknown or expired entry; see elbab list")
+    if a.var not in entry["credentials"]:
+        die(f"{a.entry} has no {a.var}; it has {', '.join(entry['credentials'])}")
+    emit(entry["credentials"][a.var], a.copy)
+
+
+def parse(rel, data):
+    if str(rel).endswith((".csv", ".csv.age")):
+        reader = csv.DictReader(io.StringIO(data.decode("utf-8-sig"), newline=""))
+        return {row.get("record_id", str(i)): row for i, row in enumerate(reader)}
+    try:
+        return json.loads(data)
+    except ValueError:
+        die(f"{rel} is not JSON or CSV; use elbab cat")
+
+
+def mask_rows(rows):
+    return {rid: {k: (MASK if secret_column(k) and v else mask_text(v)) for k, v in row.items()}
+            for rid, row in rows.items()}
+
+
+def cmd_show(a):
+    obj = parse(a.file, read(a.file))
+    if not reveal(a):
+        if resolve(a.file)[0] == ROOT / KEYS:  # every credential value is secret, whatever its name
+            for entry in obj.get("entries", {}).values():
+                entry["credentials"] = {k: MASK for k in entry.get("credentials", {})}
+        obj = mask_rows(obj) if str(a.file).endswith((".csv", ".csv.age")) else mask(obj)
+    print(json.dumps(walk(obj, a.path or ""), indent=2, ensure_ascii=False))
+
+
+def cmd_field(a):
+    emit(walk(parse(a.file, read(a.file)), a.path), a.copy)
+
+
+def cmd_set(a):
+    raw = read_secret(a.path, a.hidden)
+    with keys_lock() if resolve(a.file)[0] == ROOT / KEYS else contextlib.nullcontext():
+        data = json.loads(read(a.file))
+        parts = [p for p in a.path.split("/") if p] or die("give a path")
+        node = data
+        for part in parts[:-1]:
+            node = node.setdefault(part, {}) if isinstance(node, dict) else node[int(part)]
+        try:
+            value = json.loads(raw) if a.json else raw
+        except ValueError:
+            die("--json value is not valid JSON")
+        if isinstance(node, list):
+            node[int(parts[-1])] = value
+        else:
+            node[parts[-1]] = value
+        write(a.file, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode())
+    print(f"set {a.file}:{a.path}", file=sys.stderr)
+
+
+def store_vars(name, values, a, how):
+    with keys_lock():
+        keys = load_keys()
+        entry = keys["entries"].setdefault(name, {"provider": getattr(a, "provider", None) or name.split(".")[0],
+                                                   "scope": a.scope or getattr(a, "default_scope", None) or "",
+                                                   "context": {}})
+        if a.scope:
+            entry["scope"] = a.scope
+        if a.note is not None:
+            entry["notes"] = a.note
+        entry.setdefault("credentials", {}).update(values)
+        entry["verification"] = getattr(a, "verification", None) or f"{datetime.now():%Y-%m-%d}: stored with elbab {how}"
+        entry["sources"] = [f"entered via elbab {how}"]
+        save_keys(keys)
+
+
+def cmd_set_key(a):
+    value = read_secret(f"{a.entry} {a.var}", a.hidden)
+    store_vars(a.entry, {a.var: value}, a, "set-key")
+    print(f"stored {a.entry} {a.var}", file=sys.stderr)
+
+
+def cmd_import_env(a):
+    """KEY=VALUE lines (export prefixes, quotes and comments allowed) into one entry."""
+    values = {}
+    for line in Path(a.file).read_text().splitlines():
+        m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        value = m.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        else:
+            value = re.sub(r"\s+#.*$", "", value)
+        values[m.group(1)] = value
+    if not values:
+        die(f"no KEY=VALUE lines in {a.file}")
+    store_vars(a.entry, values, a, "import-env")
+    print(f"stored {len(values)} variables in {a.entry}: {', '.join(values)}; run with: elbab run {a.entry} -- CMD",
+          file=sys.stderr)
+
+
+def parse_duration(value):
+    text = value.lower()
+    if len(text) > 80 or not re.fullmatch(r"(?:[0-9]+[smhdw])+", text):
+        raise argparse.ArgumentTypeError("use a duration such as 12d, 2h, 1m or 1h30m")
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    try:
+        seconds = sum(int(n) * units[unit] for n, unit in re.findall(r"([0-9]+)([smhdw])", text))
+        if seconds <= 0:
+            raise ValueError
+        duration = timedelta(seconds=seconds)
+        datetime.now(timezone.utc) + duration
+        return duration
+    except (ValueError, OverflowError):
+        raise argparse.ArgumentTypeError("duration must be positive and within the supported date range") from None
+
+
+def password_name(name, permanent=False):
+    pattern = r"[A-Za-z0-9][A-Za-z0-9_.@-]*" if permanent else r"[A-Za-z0-9][A-Za-z0-9_.-]*"
+    if len(name) > 128 or not re.fullmatch(pattern, name):
+        die("name must start with a letter/digit and contain only letters, digits, dots, underscores or hyphens" +
+            (" (or @ for a permanent login)" if permanent else ""))
+    if permanent and name.startswith("tmp."):
+        die("tmp. names are reserved for expiring credentials; choose a permanent name without tmp.")
+
+
+def password_input(name, hidden):
+    login = None
+    value = read_secret(name, hidden)
+    if " / " in value:
+        login, password = value.split(" / ", 1)
+    else:
+        password = value
+    if login is not None:
+        login = login.strip()
+        if not login or not login.isprintable():
+            die("login must be nonempty and contain no control characters")
+    if not password:
+        die("empty password; nothing changed")
+    return {**({"USERNAME": login} if login is not None else {}), "PASSWORD": password}
+
+
+def permanent_password_entry(keys, name):
+    previous = keys["entries"].get(name)
+    if previous is not None and (previous.get("temporary") or "PASSWORD" not in previous.get("credentials", {})):
+        die("existing entry is not a password; use another name or set-key")
+    return previous
+
+
+def cmd_save(a):
+    password_name(a.name, permanent=True)
+    permanent_password_entry(load_keys(), a.name)
+    credentials = password_input(a.name, a.hidden)
+    with keys_lock():
+        keys = load_keys()
+        previous = permanent_password_entry(keys, a.name)
+        created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        entry = previous or {"provider": "login", "scope": "login", "created_at": created}
+        if a.scope is not None:
+            entry["scope"] = a.scope
+        if a.note is not None:
+            entry["notes"] = a.note
+        entry["credentials"] = {**entry.get("credentials", {}), **credentials}
+        entry["verification"] = f"{datetime.now():%Y-%m-%d}: stored with elbab save; login not tested"
+        entry["sources"] = [*entry.get("sources", []), "entered via elbab save"]
+        keys["entries"][a.name] = entry
+        save_keys(keys)
+    print(f"stored {a.name}; permanent (no expiry)", file=sys.stderr)
+
+
+def cmd_tmp(a):
+    password_name(a.name)
+    name = "tmp." + a.name
+    credentials = password_input(name, a.hidden)
+    previous = load_keys()["entries"].get(name)
+    if previous is not None and not previous.get("temporary"):
+        die(f"{name} is a permanent entry; choose another temporary name")
+    with keys_lock():
+        keys = load_keys()
+        previous = keys["entries"].get(name)
+        if previous is not None and not previous.get("temporary"):
+            die(f"{name} is a permanent entry; choose another temporary name")
+        created = datetime.now(timezone.utc)
+        try:
+            expires = created + a.duration
+        except OverflowError:
+            die("duration exceeds the supported date range; nothing changed")
+        entry = {
+            "provider": "temporary", "scope": a.scope or "temporary login",
+            "temporary": True, "created_at": created.isoformat(), "expires_at": expires.isoformat(),
+            "credentials": credentials, "sources": ["entered via elbab tmp"],
+        }
+        if previous is not None and "notes" in previous:
+            entry["notes"] = previous["notes"]
+        if a.note is not None:
+            entry["notes"] = a.note
+        keys["entries"][name] = entry
+        keys["elbab_temporary_credentials"] = 1
+        save_keys(keys)
+    print(f"stored {name}; expires {expires.isoformat(timespec='seconds')}", file=sys.stderr)
+
+
+def cmd_csv(a):
+    fields, rows = load_csv()
+    if a.csv_cmd == "get":
+        row = next((r for r in rows if r.get("record_id") == a.record), None) or die("no such record_id")
+        if a.column not in row:
+            die(f"no column {a.column}")
+        emit(row[a.column], a.copy)
+    elif a.csv_cmd == "query":
+        out = rows
+        if a.any:  # any non-secret column, so a service filed under its URL is not missed
+            out = [r for r in out if any(a.any.lower() in (v or "").lower() for k, v in r.items() if not secret_column(k))]
+        for cond in a.where:
+            col, _, text = cond.partition("=")
+            if col not in fields:
+                die(f"no column {col}; columns: {', '.join(fields)}")
+            out = [r for r in out if text.lower() in (r.get(col) or "").lower()]
+        cols, shown = (a.cols.split(",") if a.cols else fields), reveal(a)
+        missing = [c for c in cols if c not in fields]
+        if missing:
+            die(f"no column {', '.join(missing)}")
+        view = [{c: (r.get(c) or "") if shown else (MASK if secret_column(c) and r.get(c) else mask_text(r.get(c) or ""))
+                 for c in cols} for r in out]
+        if a.json:
+            print(json.dumps(view, indent=2, ensure_ascii=False))
+        else:
+            w = csv.DictWriter(sys.stdout, fieldnames=cols, lineterminator="\n")
+            w.writeheader()
+            w.writerows(view)
+        print(f"{len(view)} of {len(rows)} rows", file=sys.stderr)
+    elif a.csv_cmd == "columns":
+        print("\n".join(fields))
+    elif a.csv_cmd == "upsert":
+        try:
+            new = json.loads(sys.stdin.read())
+        except ValueError:
+            die("stdin must be one JSON object")
+        rid = str(new.get("record_id") or die("record_id is required"))
+        unknown = [k for k in new if k not in fields]
+        if unknown:
+            die(f"unknown columns: {', '.join(unknown)}")
+        row = next((r for r in rows if r.get("record_id") == rid), None)
+        if row is None:
+            rows.append({f: str(new.get(f, "")) for f in fields})
+            action = "added"
+        else:
+            row.update({k: str(v) for k, v in new.items()})
+            action = "updated"
+        write(CREDS, dump_csv(fields, rows))
+        print(f"{action} record {rid}", file=sys.stderr)
+
+
+def cmd_cat(a):
+    sys.stdout.buffer.write(read(a.file))
+
+
+def cmd_put(a):
+    data = sys.stdin.buffer.read()
+    if not data:
+        die("nothing on stdin; nothing changed")
+    write(a.file, data)
+    print(f"wrote {a.file}", file=sys.stderr)
+
+
+def tree():
+    for path in sorted(ROOT.rglob("*")):
+        rel = path.relative_to(ROOT).as_posix()
+        if path.is_file() and not any(p in SKIP_DIRS for p in path.relative_to(ROOT).parts):
+            yield path, rel
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def cmd_migrate(a):
+    todo = [(p, r) for p, r in tree() if not r.endswith(".age") and not plaintext_ok(r)
+            and p.name != ".DS_Store" and not p.name.startswith(".elbab.")]
+    for path, rel in todo:
+        data = path.read_bytes()
+        enc = path.with_name(path.name + ".age")
+        if enc.exists() and digest(age_decrypt(enc)) == digest(data):
+            continue
+        if a.dry_run:
+            print(f"would encrypt {rel}")
+            continue
+        write_private(enc, age_encrypt(data))
+        if digest(age_decrypt(enc)) != digest(data):
+            die(f"read-back check failed for {rel}")
+        print(f"encrypted {rel}")
+    if not a.dry_run and (ROOT / KEYS).exists():
+        write_index(json.loads((ROOT / KEYS).read_bytes()))
+
+
+def cmd_purge(a):
+    removed = 0
+    for path, rel in list(tree()):
+        if path.name == ".DS_Store":
+            path.unlink()
+            continue
+        if rel.endswith(".age") or plaintext_ok(rel):
+            continue
+        enc = path.with_name(path.name + ".age")
+        if not enc.exists():
+            print(f"kept {rel}: no encrypted copy")
+            continue
+        if digest(age_decrypt(enc)) != digest(path.read_bytes()):
+            print(f"kept {rel}: encrypted copy differs; run elbab migrate first")
+            continue
+        path.unlink()
+        removed += 1
+    print(f"removed {removed} plaintext files")
+
+
+def cmd_rekey(a):
+    count = 0
+    for path, rel in list(tree()):
+        if rel.endswith(".age"):
+            data = age_decrypt(path)
+            write_private(path, age_encrypt(data))
+            if age_decrypt(path) != data:
+                die(f"read-back check failed for {rel}")
+            count += 1
+    print(f"re-encrypted {count} files to {len(recipient_lines())} recipients")
+
+
+def cmd_verify(a):
+    problems = []
+    check_private(ROOT, 0o700)
+    t0 = time.perf_counter()
+    identity()
+    t_id = (time.perf_counter() - t0) * 1000
+    encrypted = 0
+    for path, rel in tree():
+        if path.name.startswith(".elbab."):
+            problems.append(f"leftover temp file {rel}")
+        elif rel.endswith(".age"):
+            age_decrypt(path)
+            encrypted += 1
+        elif plaintext_ok(rel):
+            text = path.read_text(errors="replace")
+            if re.search(r"AGE-SECRET-KEY-1[0-9A-Z]{50,}", text) or (rel != "recipients.txt" and SECRET_VALUE.search(text)):
+                problems.append(f"{rel} contains something that looks like a secret")
+        elif path.name != ".DS_Store":
+            problems.append(f"plaintext file {rel}")
+    t0 = time.perf_counter()
+    load_keys()
+    t_keys = (time.perf_counter() - t0) * 1000
+    backend = load_config().get("identity", {}).get("backend", "ELBAB_IDENTITY_FILE")
+    print(f"{encrypted} encrypted files decrypt; {len(recipient_lines())} recipients; {backend} identity "
+          f"{t_id:.0f} ms; keys.json {t_keys:.0f} ms")
+    for name in guards():
+        d, present = guard_files(name)
+        if present and not live_pids(d / ".elbab-guard.pids"):
+            print(f"warning: {len(present)} {name} login files are plaintext; run: elbab guard-seal {name}")
+    for p in registered():
+        if is_encrypted(p):
+            age_decrypt(p)
+        elif os.path.lexists(p) and not live_pids(side(p, "pids")):
+            print(f"warning: {p} was encrypted and is decrypted now; run: elbab encrypt {quote(p)}")
+    for p in problems:
+        print(f"problem: {p}")
+    sys.exit(1 if problems else 0)
+
+
+def drop_root():
+    """elbab never needs root. Under sudo, become the invoking user again before touching anything."""
+    uid, gid = int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", os.environ["SUDO_UID"]))
+    user = pwd.getpwuid(uid)
+    os.setgroups(os.getgrouplist(user.pw_name, gid))
+    os.setgid(gid)
+    os.setuid(uid)
+    os.environ.update(HOME=user.pw_dir, USER=user.pw_name, LOGNAME=user.pw_name)
+
+
+# ---------- AWS: keys in the store, keyless stubs in ~/.aws ----------
+
+def read_ini(text):
+    cp = configparser.ConfigParser(interpolation=None, default_section="elbab-no-default")
+    cp.optionxform = str
+    cp.read_string(text)
+    return cp
+
+
+def self_command(*args):
+    """A command line that runs this program, for files other tools execute."""
+    if WINDOWS:
+        return subprocess.list2cmdline([sys.executable, "-I", str(ME), *args])
+    return " ".join(shlex.quote(x) for x in (str(ME), *args))
+
+
+def cmd_aws(a):
+    """credential_process for a ~/.aws stub: the profile's keys, as the JSON every AWS SDK accepts."""
+    cp = read_ini(read(f"aws/{a.file}").decode())
+    s = cp[a.profile] if cp.has_section(a.profile) else die(f"aws/{a.file} has no [{a.profile}] profile")
+    if not s.get("aws_access_key_id") or not s.get("aws_secret_access_key"):
+        die(f"aws/{a.file} [{a.profile}] has no access key")
+    out = {"Version": 1, "AccessKeyId": s["aws_access_key_id"].strip(), "SecretAccessKey": s["aws_secret_access_key"].strip()}
+    if s.get("aws_session_token"):
+        out["SessionToken"] = s["aws_session_token"].strip()
+    print(json.dumps(out))
+
+
+def cmd_aws_protect(a):
+    """Keys into aws/FILE (the whole original is kept). The file keeps its path and every other setting, plus a
+    credential_process line, so --profile and AWS_SHARED_CREDENTIALS_FILE keep working."""
+    for f in a.files:
+        path = Path(f).expanduser().absolute()
+        try:
+            rel = path.relative_to(AWS_DIR).as_posix()
+        except ValueError:
+            die(f"{path} is not under {AWS_DIR}")
+        check_private(path, 0o600)
+        text = path.read_text()
+        cp = read_ini(text)
+        keyed = [s for s in cp.sections() if any(k in cp[s] for k in AWS_SECRET_FIELDS)]
+        if not keyed:
+            print(f"skipped {path}: no keys in it")
+            continue
+        if stored(f"aws/{rel}"):  # stored already, e.g. from another machine: never replace different keys
+            if read(f"aws/{rel}") != text.encode():
+                die(f"aws/{rel} already holds different keys; compare them before replacing ({path} unchanged)")
+        else:
+            write(f"aws/{rel}", text.encode())
+        for s in keyed:  # every profile must resolve to exactly the original keys before the file changes
+            r = subprocess.run([sys.executable, "-I", str(ME), "aws", rel, s], capture_output=True, text=True)
+            got = json.loads(r.stdout or "{}")
+            if (got.get("AccessKeyId"), got.get("SecretAccessKey")) != (cp[s].get("aws_access_key_id", "").strip(),
+                                                                       cp[s].get("aws_secret_access_key", "").strip()):
+                die(f"check failed for {rel} [{s}]; {path} unchanged")
+        lines = [f"# Keys for this file are encrypted by elbab (aws/{rel}); edit with: elbab cat/put aws/{rel}\n"]
+        for s in cp.sections():
+            lines.append(f"[{s}]\n")
+            lines += [f"{k} = {v}\n" for k, v in cp[s].items() if k not in AWS_SECRET_FIELDS and k != "credential_process"]
+            if s in keyed:
+                lines.append(f"credential_process = {self_command('aws', rel, s)}\n")
+            lines.append("\n")
+        write_private(path, ("".join(lines).rstrip("\n") + "\n").encode())
+        print(f"protected {path} ({len(keyed)} profile{'s' * (len(keyed) > 1)})")
+
+
+# ---------- SSH keys: random passphrases kept in the store (and the macOS Keychain) ----------
+
+@contextlib.contextmanager
+def askpass(secret):
+    """Env that makes ssh, ssh-add and ssh-keygen take `secret` from a helper instead of a terminal."""
+    d = tempfile.mkdtemp(prefix="elbab-askpass.")
+    if WINDOWS:  # token_urlsafe passphrases hold no characters cmd treats specially
+        helper = Path(d) / "askpass.cmd"
+        helper.write_text("@echo off\r\necho %ELBAB_ASKPASS%\r\n")
+    else:
+        helper = Path(d) / "askpass"
+        helper.write_text('#!/bin/sh\nprintf "%s\\n" "$ELBAB_ASKPASS"\n')
+        helper.chmod(0o700)
+    try:
+        yield dict(os.environ, SSH_ASKPASS=str(helper), SSH_ASKPASS_REQUIRE="force", ELBAB_ASKPASS=secret,
+                   DISPLAY=os.environ.get("DISPLAY", ":0"))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def ssh_run(args, env=None):
+    """No terminal, so nothing can stop to prompt."""
+    if env is None:
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("SSH_ASKPASS", "ELBAB_ASKPASS"))}
+    return subprocess.run(args, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          **({} if WINDOWS else {"start_new_session": True}))
+
+
+def key_path(k):
+    p = Path(k).expanduser().absolute()
+    if p.is_symlink() or not p.is_file():
+        die(f"{p} is not a key file")
+    return p
+
+
+def has_passphrase(p):
+    return ssh_run(["ssh-keygen", "-y", "-P", "", "-f", str(p)]).returncode != 0
+
+
+def fingerprint(p):
+    r = ssh_run(["ssh-keygen", "-l", "-f", str(p)])
+    return r.stdout.split()[1] if r.returncode == 0 and r.stdout.split()[1:] else None
+
+
+def load_passes():
+    return json.loads(read(SSH_PASS)) if stored(SSH_PASS) else {}
+
+
+def save_passes(passes):
+    write(SSH_PASS, (json.dumps(passes, indent=1, sort_keys=True) + "\n").encode())
+    write_private(SSH_INDEX, "".join(f"{k}\n" for k in sorted(passes)).encode())
+
+
+def ssh_keychain_store(p, env):
+    """Passphrase into the login Keychain, where ssh (UseKeychain yes) and ssh-add --apple-use-keychain find it.
+    The agent is left as it was, then a throwaway agent proves the Keychain alone unlocks the key."""
+    fp = fingerprint(p.with_name(p.name + ".pub"))
+    loaded = fp in ssh_run(["ssh-add", "-l"]).stdout
+    r = ssh_run(["ssh-add", "--apple-use-keychain", str(p)], env)
+    if r.returncode:
+        return f"ssh-add could not store it: {r.stderr.strip()}"
+    if not loaded:
+        ssh_run(["ssh-add", "-d", str(p)])
+    d = tempfile.mkdtemp(prefix="elbab-agent.")
+    sock = f"{d}/agent"
+    agent = subprocess.Popen(["ssh-agent", "-D", "-a", sock], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(50):
+            if Path(sock).exists():
+                break
+            time.sleep(0.05)
+        clean = {k: v for k, v in os.environ.items() if not k.startswith(("SSH_ASKPASS", "ELBAB_ASKPASS"))}
+        ok = ssh_run(["ssh-add", "--apple-use-keychain", str(p)], dict(clean, SSH_AUTH_SOCK=sock)).returncode == 0
+    finally:
+        agent.terminate()
+        agent.wait(timeout=5)
+        shutil.rmtree(d, ignore_errors=True)
+    return None if ok else "the Keychain did not unlock it"
+
+
+def cmd_ssh_protect(a):
+    passes = load_passes()
+    for k in a.keys:
+        p = key_path(k)
+        check_private(p, 0o600)
+        if has_passphrase(p):
+            print(f"skipped {p}: it already has a passphrase" + (" (stored here)" if str(p) in passes else " (not stored here)"))
+            continue
+        pub = ssh_run(["ssh-keygen", "-y", "-P", "", "-f", str(p)]).stdout.split()
+        if not pub:
+            die(f"{p} is not a private key ssh-keygen can read")
+        pubfile = p.with_name(p.name + ".pub")
+        if pubfile.exists() and pubfile.read_text().split()[:2] != pub[:2]:
+            die(f"{pubfile} does not match {p}; fix that first")
+        if not pubfile.exists():
+            pubfile.write_text(f"{pub[0]} {pub[1]} {p.name}\n")
+            pubfile.chmod(0o644)
+        original, mode = p.read_bytes(), stat.S_IMODE(p.stat().st_mode)
+        write(f"ssh/originals/{HOST}/{path_key(p)}", original)
+        secret = secrets.token_urlsafe(32)
+        passes[str(p)] = secret
+        save_passes(passes)
+        with askpass(secret) as env:
+            os.chmod(p, 0o600)
+            r = ssh_run(["ssh-keygen", "-p", "-a", "1", "-P", "", "-f", str(p)], env)  # 1 KDF round: the passphrase is random
+            os.chmod(p, mode)
+            ok = r.returncode == 0 and has_passphrase(p) and ssh_run(["ssh-keygen", "-y", "-f", str(p)], env).stdout.split()[:2] == pub[:2]
+            problem = None if ok else (r.stderr.strip() or "the new file did not check out")
+            if ok and sys.platform == "darwin" and not os.environ.get("ELBAB_NO_KEYCHAIN"):  # tests skip the Keychain
+                problem = ssh_keychain_store(p, env)
+        if problem:
+            os.chmod(p, 0o600)
+            p.write_bytes(original)
+            os.chmod(p, mode)
+            die(f"could not protect {p}: {problem}; the original key is back in place")
+        print(f"protected {p} {fingerprint(pubfile)}")
+
+
+def cmd_ssh_load(a):
+    passes = load_passes()
+    keys = [str(key_path(k)) for k in a.keys] or sorted(passes)
+    sock = os.environ.get("SSH_AUTH_SOCK")
+    for _ in range(0 if WINDOWS else 100):  # under systemd or launchd the agent may still be starting
+        if a.keychain or (sock and Path(sock).exists()):
+            break
+        time.sleep(0.1)
+    if a.exact:  # the agent should hold exactly these keys; a new shell pays almost nothing when it already does
+        want = {fingerprint(Path(k + ".pub")) or fingerprint(Path(k)) for k in keys}
+        have = {f.split()[1] for f in ssh_run(["ssh-add", "-l"]).stdout.splitlines() if len(f.split()) > 1}
+        if have == want:
+            return
+        ssh_run(["ssh-add", "-D"])
+    failed = 0
+    for k in keys:
+        if k not in passes or not Path(k).exists():
+            print(f"skipped {k}: " + ("no passphrase stored for it" if k not in passes else "the file is gone"))
+            failed += k not in passes
+            continue
+        with askpass(passes[k]) as env:
+            r = ssh_run(["ssh-add", *(["--apple-use-keychain"] if a.keychain else []), k], env)
+        print(("loaded " if r.returncode == 0 else "FAILED ") + k + ("" if r.returncode == 0 else f": {r.stderr.strip()}"))
+        failed += r.returncode != 0
+    sys.exit(1 if failed else 0)
+
+
+def cmd_ssh_pass(a):
+    emit(load_passes().get(str(key_path(a.key))) or die("no passphrase stored for that key"), a.copy)
+
+
+def pubkey_files():
+    """name -> .pub: everything under ~/.ssh, plus the protected keys elsewhere that this machine lists."""
+    ssh = HOME / ".ssh"
+    found = {}
+    for pub in sorted(ssh.rglob("*.pub")) if ssh.exists() else []:
+        found[pub.relative_to(ssh).as_posix()[:-4]] = pub
+    for line in (SSH_INDEX.read_text().splitlines() if SSH_INDEX.exists() else []):
+        pub = Path(line + ".pub")
+        if line and pub.exists() and pub not in found.values():
+            name = pub.name[:-4] if pub.name[:-4] not in found else f"{pub.parent.name}/{pub.name[:-4]}"
+            found[name] = pub
+    return {n: p for n, p in found.items() if re.match(r"(ssh|ecdsa|sk)-", p.read_text(errors="replace"))}
+
+
+def cmd_pubkeys(a):
+    keys = pubkey_files()
+    if a.name:
+        hits = [n for n in keys if n == a.name] or [n for n in keys if n.split("/")[-1] == a.name] \
+            or [n for n in keys if a.name.lower() in n.lower()]
+        if len(hits) != 1:
+            die(f"{'no' if not hits else 'more than one'} key matches {a.name}: " + ", ".join(hits or keys))
+        print(keys[hits[0]].read_text().strip())
+    elif a.list:
+        width = max(map(len, keys), default=4)
+        for n, pub in keys.items():
+            info = ssh_run(["ssh-keygen", "-l", "-f", str(pub)]).stdout.split()
+            private = pub.with_name(pub.name[:-4])
+            state = ("passphrase" if has_passphrase(private) else "NO PASSPHRASE") if private.exists() else "public only"
+            print(f"{n:<{width}}  {(info[-1].strip('()') + ' ' + info[0]) if info else '?':<12} "
+                  f"{info[1] if info else '?':<50}  {state:<13}  {str(pub).replace(str(HOME), '~')}")
+    else:
+        for n, pub in keys.items():
+            print(f"# {n}\n{pub.read_text().strip()}\n")
+
+
+# ---------- CLI logins with no secure store of their own: decrypted only while the CLI runs ----------
+
+BUILTIN_GUARDS = {  # name: its config directory (relative to home) and the files there that hold logins
+    "gcloud": {"dir": "%APPDATA%/gcloud" if WINDOWS else ".config/gcloud", "aliases": ["gsutil", "bq"],
+               "files": ["credentials.db*", "access_tokens.db*", "application_default_credentials.json",
+                         "legacy_credentials/**/*"]},
+    "az": {"dir": ".azure", "files": ["msal_token_cache.*", "msal_http_cache.bin", "service_principal_entries.*"]},
+}
+
+
+def guards():
+    user = json.loads(GUARDS_FILE.read_text()) if GUARDS_FILE.exists() else {}
+    return {**BUILTIN_GUARDS, **user}
+
+
+def guard_dir(spec):
+    d = Path(os.path.expandvars(spec["dir"])).expanduser()
+    return d if d.is_absolute() else HOME / d
+
+
+def guard_name(name):
+    g = guards()
+    if name in g:
+        return name
+    return next((n for n, s in g.items() if name in s.get("aliases", [])), None) or \
+        die(f"no guard for {name}; known: {', '.join(g)}")
+
+
+@contextlib.contextmanager
+def guard_lock(d):
+    with file_lock(d / ".elbab-guard.lock"):
+        yield
+
+
+def pid_alive(pid):
+    if WINDOWS:  # os.kill(pid, 0) would terminate the process on Windows
+        import ctypes
+        k = ctypes.WinDLL("kernel32")
+        h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def live_pids(f):
+    return {pid for pid in ({int(x) for x in f.read_text().split()} if f.exists() else set()) if pid_alive(pid)}
+
+
+def set_pids(f, pids):
+    f.write_text("".join(f"{p}\n" for p in sorted(pids)))
+
+
+def guard_files(name):
+    spec = guards()[name]
+    d = guard_dir(spec)
+    return d, sorted({p for g in spec["files"] for p in d.glob(g)
+                      if p.is_file() and not p.is_symlink() and not p.name.endswith(".lockfile")})
+
+
+def guard_open(name):
+    """Put the stored logins back in place. A different file already there came from a run without the guard (many
+    tools create empty databases when they find none) or a crash; it is kept, encrypted, under tools-conflicts/ and
+    the stored login wins."""
+    d, store = guard_dir(guards()[name]), ROOT / "tools" / name
+    opened = []
+    for enc in (sorted(store.rglob("*.age")) if store.exists() else []):
+        rel = enc.relative_to(store).as_posix()[:-4]
+        target = d / rel
+        data = age_decrypt(enc)
+        if target.exists() and target.read_bytes() != data:
+            write(f"tools-conflicts/{name}/{rel}.{datetime.now():%Y%m%dT%H%M%S}", target.read_bytes())
+            print(f"elbab: {name} {rel} changed outside elbab guard; restored the stored copy, kept the other in "
+                  f"tools-conflicts/", file=sys.stderr)
+            target.unlink()
+        if not target.exists():
+            write_private(target, data)
+        opened.append(rel)
+    (d / ".elbab-guard.opened").write_text("".join(f"{r}\n" for r in opened))
+
+
+def guard_seal(name):
+    """Encrypt the tool's login files into tools/NAME and remove the plaintext. A stored file that was opened for
+    this run and is gone now was deleted by the tool (a logout), so the stored copy goes too."""
+    d, present = guard_files(name)
+    marker = d / ".elbab-guard.opened"
+    opened = set(marker.read_text().split("\n")) - {""} if marker.exists() else set()
+    for path in present:
+        rel = path.relative_to(d).as_posix()
+        data = path.read_bytes()
+        enc = resolve(f"tools/{name}/{rel}")[1]
+        if not enc.exists() or age_decrypt(enc) != data:
+            write(f"tools/{name}/{rel}", data)
+            for old in sorted(BACKUPS.glob(f"tools__{name}__{rel.replace('/', '__')}.*.age"))[:-5]:  # last 5 kept
+                old.unlink()
+        path.unlink()
+        opened.discard(rel)
+    for rel in opened:
+        resolve(f"tools/{name}/{rel}")[1].unlink(missing_ok=True)
+    marker.unlink(missing_ok=True)
+    return len(present)
+
+
+def real_binary(name):
+    shims = SHIMS.resolve()
+    path = os.pathsep.join(p for p in os.environ.get("PATH", os.defpath).split(os.pathsep)
+                           if p and Path(p).resolve() != shims)
+    return shutil.which(name, path=path) or die(f"{name} is not installed (outside {SHIMS})")
+
+
+def guard_run(called, args):
+    name = guard_name(called)
+    spec = guards()[name]
+    real = real_binary(spec.get("binary") or called)
+    d = guard_dir(spec)
+    with guard_lock(d):
+        live = live_pids(d / ".elbab-guard.pids")
+        if not live:
+            guard_open(name)
+        set_pids(d / ".elbab-guard.pids", live | {os.getpid()})
+    env = {**os.environ, spec["env"]: str(d)} if spec.get("env") else None
+    rc = wait_forwarding(subprocess.Popen([real, *args], env=env))
+    with guard_lock(d):
+        live = live_pids(d / ".elbab-guard.pids") - {os.getpid()}
+        set_pids(d / ".elbab-guard.pids", live)
+        if not live:
+            guard_seal(name)
+    sys.exit(rc if rc >= 0 else 128 - rc)
+
+
+def cmd_guard_seal(a):
+    name = guard_name(a.tool)
+    d = guard_dir(guards()[name])
+    with guard_lock(d):
+        if live_pids(d / ".elbab-guard.pids"):
+            die(f"{name} is running; its logins are sealed when it exits")
+        print(f"sealed {guard_seal(name)} {name} login files")
+
+
+def cmd_guard_add(a):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", a.name):
+        die("guard names are letters, digits, dots, underscores or hyphens")
+    user = json.loads(GUARDS_FILE.read_text()) if GUARDS_FILE.exists() else {}
+    user[a.name] = {k: v for k, v in {"dir": a.dir, "files": a.files, "binary": a.binary, "aliases": a.alias,
+                                      "env": a.env}.items() if v}
+    write_private(GUARDS_FILE, (json.dumps(user, indent=2) + "\n").encode())
+    write_shims()
+    d, present = guard_files(a.name)
+    print(f"guard {a.name}: {len(present)} login files in {d} match" +
+          (f"; seal them now: elbab guard-seal {a.name}" if present else ""))
+
+
+def write_shims():
+    SHIMS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    names = [n for name, spec in guards().items() for n in (name, *spec.get("aliases", []))]
+    for n in names:
+        if WINDOWS:
+            (SHIMS / f"{n}.cmd").write_text(f'@echo off\r\n"{sys.executable}" -I "{ME}" guard {n} %*\r\n')
+        else:
+            shim = SHIMS / n
+            shim.write_text("#!/bin/sh\n# elbab shim: this tool's login stays encrypted and is decrypted only while it runs.\n"
+                            f'exec /usr/bin/env python3 -I {shlex.quote(str(ME))} guard "$(basename "$0")" "$@"\n')
+            shim.chmod(0o700)
+    return names
+
+
+def cmd_shims(a):
+    names = write_shims()
+    print(f"wrote {len(names)} shims ({', '.join(names)}) to {SHIMS}; put that folder first on PATH:\n" +
+          (f'  setx PATH "{SHIMS};%PATH%"' if WINDOWS else f'  export PATH="{SHIMS}:$PATH"'))
+
+
+def wait_forwarding(child):
+    def forward(sig, _frame):  # the terminal already sends Ctrl-C to the whole process group
+        if sig != signal.SIGINT:
+            child.send_signal(sig)
+    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            signal.signal(sig, forward)
+    return child.wait()
+
+
+# ---------- any file or folder: encrypted in place (one age file at the same path), or to a copy with -o ----------
+
+AGE_MAGIC = b"age-encryption.org/v1\n"
+PATH_MAX = 256 << 20  # packed in memory: this is for keys and configs, not projects
+PATHS = ROOT / f"encrypted-{HOST}.txt"  # plaintext list of what was encrypted in place, for verify and --dump
+JUNK = {".DS_Store", "Thumbs.db"}
+
+
+def quote(s):
+    return subprocess.list2cmdline([str(s)]) if WINDOWS else shlex.quote(str(s))
+
+
+def unlink(p):
+    try:
+        p.unlink()
+    except PermissionError:
+        if not WINDOWS:
+            raise
+        os.chmod(p, stat.S_IWRITE)  # Windows will not delete a read-only file
+        p.unlink()
+
+
+def rmtree(d):
+    for top, subdirs, names in os.walk(d, topdown=False):
+        for name in names:
+            unlink(Path(top) / name)
+        for name in subdirs:
+            os.chmod(Path(top) / name, 0o700)
+            os.rmdir(Path(top) / name)
+    os.chmod(d, 0o700)
+    os.rmdir(d)
+
+
+def is_encrypted(p):
+    if not p.is_file() or p.is_symlink():
+        return False
+    with open(p, "rb") as fh:
+        return fh.read(len(AGE_MAGIC)) == AGE_MAGIC
+
+
+def target(arg, new=False):
+    """An absolute path that is not a link, the home folder or the store. new: it must not exist yet (-o)."""
+    p = Path(os.path.abspath(Path(arg).expanduser()))
+    if "\n" in str(p):
+        die("paths with line breaks are not supported")
+    if new:
+        if os.path.lexists(p):
+            die(f"{p} already exists; nothing written")
+        if not p.parent.is_dir():
+            die(f"{p.parent} is not a folder")
+        p = p.parent.resolve() / p.name
+    else:
+        if p.is_symlink() or getattr(p, "is_junction", lambda: False)():
+            die(f"{p} is a link; give the path it points to")
+        if not p.exists():
+            die(f"{p} does not exist")
+        p = p.resolve()
+    if p == ROOT or ROOT in p.parents or p in ROOT.parents:
+        die(f"{p} overlaps the store; files there are managed with elbab put and elbab cat")
+    if p == HOME.resolve() or p in HOME.resolve().parents:
+        die(f"{p} is the home folder or above it")
+    return p
+
+
+def side(p, what):
+    """Files kept beside p while elbab run has it decrypted: the pids using it and the previous ciphertext."""
+    return p.parent / f".{p.name}.elbab-{what}"
+
+
+def path_lock(p):
+    return file_lock(CONFIG_DIR / "locks" / f"{hashlib.sha256(str(p).encode()).hexdigest()[:24]}.lock")
+
+
+def scan(d):
+    """The folder's files and subfolders, skipping OS litter. Links, hard-linked files and devices are returned
+    separately: encrypting them would leave a plaintext copy behind or lose them."""
+    files, dirs, odd = {}, {}, []
+    for top, subdirs, names in os.walk(d):
+        for name in sorted(subdirs + names):
+            if name in JUNK:
+                continue
+            p = Path(top) / name
+            rel, st = p.relative_to(d).as_posix(), p.lstat()
+            if stat.S_ISDIR(st.st_mode) and not p.is_symlink() and not getattr(p, "is_junction", lambda: False)():
+                dirs[rel] = st
+            elif stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+                files[rel] = st
+            else:
+                odd.append(rel)
+    return files, dirs, odd
+
+
+def dir_pack(entries):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT, pax_headers={"ELBAB.type": "dir"}) as tar:
+        for rel, (kind, mode, mtime, data) in sorted(entries.items()):
+            info = tarfile.TarInfo(rel)
+            info.mode, info.mtime = mode, int(mtime)
+            if kind == "dir":
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            else:
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def dir_unpack(blob):
+    out = {}
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:") as tar:
+        for m in tar.getmembers():
+            if m.name.startswith("/") or ".." in Path(m.name).parts or not (m.isfile() or m.isdir()):
+                die(f"the encrypted folder has an unsafe entry {m.name!r}")
+            out[m.name] = ("dir", m.mode, m.mtime, None) if m.isdir() else ("file", m.mode, m.mtime, tar.extractfile(m).read())
+    return out
+
+
+def as_folder(payload):
+    """The entries when a decrypted payload is a folder elbab packed, else None (it is the file itself)."""
+    try:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as tar:
+            if tar.pax_headers.get("ELBAB.type") != "dir":
+                return None
+    except tarfile.TarError:
+        return None
+    return dir_unpack(payload)
+
+
+def pack(p):
+    """(payload, number of files, ciphertext mode) for a plaintext file or folder."""
+    st = p.lstat()
+    if stat.S_ISDIR(st.st_mode):
+        files, dirs, odd = scan(p)
+        if odd:
+            die(f"{p} holds links or special files elbab cannot encrypt: {', '.join(odd[:5])}")
+        if not files:
+            die(f"{p} has no files to encrypt")
+        entries = {rel: ("dir", 0o700, s.st_mtime, None) for rel, s in dirs.items()}
+        entries.update({rel: ("file", stat.S_IMODE(s.st_mode) & 0o700 | 0o600, s.st_mtime, (p / rel).read_bytes())
+                        for rel, s in files.items()})
+        if sum(s.st_size for s in files.values()) > PATH_MAX:
+            die(f"{p} is over {PATH_MAX >> 20} MB; elbab encrypts key and config folders, not projects")
+        return dir_pack(entries), len(files), 0o600
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        die(f"{p} is not a plain file (links and hard-linked files would keep a plaintext copy)")
+    if st.st_size > PATH_MAX:
+        die(f"{p} is over {PATH_MAX >> 20} MB")
+    return p.read_bytes(), 1, 0o700 if st.st_mode & 0o100 else 0o600  # the execute bit survives the round trip
+
+
+def same(a, b):
+    fa, fb = as_folder(a), as_folder(b)
+    if fa is None or fb is None:
+        return a == b
+    key = lambda es: {r: (e[0], e[1], e[3]) for r, e in es.items()}  # ignore modification times
+    return key(fa) == key(fb)
+
+
+def put_cipher(dest, blob, expect, mode, mtime, replace=False):
+    """Write blob beside dest, check it decrypts to expect, then move it into place (replacing the plaintext file or
+    folder when replace)."""
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.elbab-", suffix=".tmp")
+    tmp = Path(tmp)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(blob)
+        os.chmod(tmp, mode)
+        os.utime(tmp, (mtime, mtime))
+        if age_decrypt(tmp) != expect:
+            die(f"read-back check failed for {dest}; nothing changed")
+        if replace and dest.is_dir():
+            aside = dest.parent / f".{dest.name}.elbab-old-{secrets.token_hex(4)}"
+            os.rename(dest, aside)
+            os.rename(tmp, dest)
+            rmtree(aside)
+        elif replace:
+            os.replace(tmp, dest)
+        elif os.path.lexists(dest):
+            die(f"{dest} already exists; nothing written")
+        else:
+            os.rename(tmp, dest)
+    finally:
+        if tmp.exists():
+            unlink(tmp)
+
+
+def put_plain(dest, payload, mode, mtime, replace=False):
+    """Write a decrypted payload at dest, owner-only: the file itself, or the folder it packs."""
+    folder = as_folder(payload)
+    if folder is None:
+        fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.elbab-", suffix=".tmp")
+        tmp = Path(tmp)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload)
+            os.chmod(tmp, mode)
+            os.utime(tmp, (mtime, mtime))
+            if not replace and os.path.lexists(dest):
+                die(f"{dest} already exists; nothing written")
+            os.replace(tmp, dest)
+        finally:
+            if tmp.exists():
+                unlink(tmp)
+        return 1
+    tmp = Path(tempfile.mkdtemp(dir=dest.parent, prefix=f".{dest.name}.elbab-"))
+    try:
+        for rel, (kind, m, t, data) in sorted(folder.items()):
+            out = tmp / rel
+            if kind == "dir":
+                out.mkdir(mode=0o700, parents=True, exist_ok=True)
+                continue
+            out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with os.fdopen(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600), "wb") as fh:
+                fh.write(data)
+            os.chmod(out, m & 0o700 | 0o600)
+            os.utime(out, (t, t))
+        for rel, (kind, _, t, _) in sorted(folder.items(), reverse=True):  # after their files are written
+            if kind == "dir":
+                os.chmod(tmp / rel, 0o700)
+                os.utime(tmp / rel, (t, t))
+        os.utime(tmp, (mtime, mtime))
+        if replace:
+            aside = dest.parent / f".{dest.name}.elbab-old-{secrets.token_hex(4)}"
+            os.rename(dest, aside)
+            os.rename(tmp, dest)
+            unlink(aside)
+        elif os.path.lexists(dest):
+            die(f"{dest} already exists; nothing written")
+        else:
+            os.rename(tmp, dest)
+    finally:
+        if tmp.exists():
+            rmtree(tmp)
+    return sum(e[0] == "file" for e in folder.values())
+
+
+def backup(enc, p):
+    """Keep a copy of p's previous ciphertext in backups/ (the last 5), before elbab replaces it."""
+    BACKUPS.mkdir(mode=0o700, exist_ok=True)
+    home = HOME.resolve()
+    flat = "paths__" + (p.relative_to(home).as_posix() if home in p.parents else path_key(p)).replace("/", "__")
+    shutil.copy2(enc, BACKUPS / f"{flat}.{datetime.now():%Y%m%dT%H%M%S%f}.age")
+    for old in sorted(n for n in os.listdir(BACKUPS) if n.startswith(flat + ".") and n.endswith(".age"))[:-5]:
+        unlink(BACKUPS / old)
+
+
+def registered():
+    return [Path(l) for l in PATHS.read_text(encoding="utf-8").splitlines() if l.strip()] if PATHS.exists() else []
+
+
+def register(p, add):
+    with keys_lock():
+        paths = {q for q in registered() if q != p and os.path.lexists(q)}
+        if add:
+            paths.add(p)
+        write_private(PATHS, "".join(f"{q}\n" for q in sorted(map(str, paths))).encode("utf-8"))
+
+
+def seal(p):
+    """Encrypt p in place. If elbab run left the previous ciphertext beside it and nothing changed, that goes back
+    as it was; if something changed, it goes to backups/."""
+    kept, pids = side(p, "open.age"), side(p, "pids")
+    if is_encrypted(p):
+        die(f"{p} is already encrypted")
+    payload, n, mode = pack(p)
+    mtime, blob, expect = p.stat().st_mtime, None, payload
+    if kept.exists():
+        old = age_decrypt(kept)
+        if same(old, payload):
+            blob, expect = kept.read_bytes(), old
+        else:
+            backup(kept, p)
+    put_cipher(p, blob or age_encrypt(payload), expect, mode, mtime, replace=True)
+    kept.unlink(missing_ok=True)
+    pids.unlink(missing_ok=True)
+    return n
+
+
+def unseal(p):
+    st = p.stat()
+    return put_plain(p, age_decrypt(p), stat.S_IMODE(st.st_mode) & 0o700 | 0o600, st.st_mtime, replace=True)
+
+
+def counted(n, folder):
+    return f" ({n} files)" if folder else ""
+
+
+def cmd_encrypt(a):
+    p = target(a.path)
+    if a.output:
+        out = target(a.output, new=True)
+        if is_encrypted(p):
+            die(f"{p} is already encrypted")
+        payload, n, mode = pack(p)
+        put_cipher(out, age_encrypt(payload), payload, mode, p.stat().st_mtime)
+        print(f"encrypted {p} to {out}{counted(n, p.is_dir())}; {p} is unchanged")
+        return
+    folder = p.is_dir()
+    with path_lock(p):
+        if live_pids(side(p, "pids")):
+            die(f"a command is using {p}; it is encrypted again when that exits")
+        n = seal(p)
+    register(p, True)
+    print(f"encrypted {p}{counted(n, folder)}")
+
+
+def cmd_decrypt(a):
+    p = target(a.path)
+    if a.output:
+        out = target(a.output, new=True)
+        if not is_encrypted(p):
+            die(f"{p} is not encrypted")
+        st = p.stat()
+        n = put_plain(out, age_decrypt(p), stat.S_IMODE(st.st_mode) & 0o700 | 0o600, st.st_mtime)
+        print(f"decrypted {p} to {out}{counted(n, out.is_dir())}; {p} stays encrypted")
+        return
+    kept = side(p, "open.age")
+    with path_lock(p):
+        if is_encrypted(p):
+            backup(p, p)
+            n = unseal(p)
+        elif kept.exists():  # elbab run has it open: keep it decrypted when the command exits
+            backup(kept, p)
+            kept.unlink()
+            n = None
+        else:
+            die(f"{p} is not encrypted")
+    register(p, False)
+    print(f"decrypted {p}{counted(n, p.is_dir()) if n else ' (it stays decrypted after the running command exits)'}; "
+          f"encrypt it again with: elbab encrypt {quote(p)}")
+
+
+def cmd_print(a):
+    p = target(a.path)
+    if is_encrypted(p):
+        payload = age_decrypt(p)
+        folder = as_folder(payload)
+    elif p.is_dir():
+        payload, folder = None, {rel: ("file", 0, 0, (p / rel).read_bytes()) for rel in scan(p)[0]}
+    else:
+        payload, folder = p.read_bytes(), None
+    out = sys.stdout.buffer
+    if folder is None:
+        out.write(payload)
+    else:
+        first = True
+        for rel, (kind, _, _, data) in sorted(folder.items()):
+            if kind == "file":
+                out.write(f"{'' if first else chr(10)}==> {rel} <==\n".encode())
+                out.write(data if not data or data.endswith(b"\n") else data + b"\n")
+                first = False
+    out.flush()
+
+
+def run_command(command):
+    try:  # which() finds .exe and .cmd on Windows
+        return wait_forwarding(subprocess.Popen([shutil.which(command[0]) or command[0], *command[1:]]))
+    except OSError as e:
+        print(f"elbab: cannot run {command[0]}: {e.strerror}", file=sys.stderr)
+        return 127
+
+
+def path_run(p, command):
+    """Run command with p decrypted in place; encrypted again when the last such command exits. A path someone
+    decrypted with elbab decrypt stays as it is."""
+    pids, kept = side(p, "pids"), side(p, "open.age")
+    with path_lock(p):
+        live = live_pids(pids)
+        if is_encrypted(p):
+            shutil.copy2(p, kept)
+            unseal(p)
+        elif not kept.exists():
+            live = None
+        if live is not None:
+            set_pids(pids, live | {os.getpid()})
+    if live is None:
+        rc = run_command(command)
+        sys.exit(rc if rc >= 0 else 128 - rc)
+    rc = run_command(command)
+    with path_lock(p):
+        live = live_pids(pids) - {os.getpid()}
+        set_pids(pids, live)
+        if not live:
+            if not kept.exists():  # someone ran elbab decrypt meanwhile
+                pids.unlink(missing_ok=True)
+            elif not os.path.lexists(p):
+                os.replace(kept, p)
+                pids.unlink(missing_ok=True)
+                print(f"elbab: the command removed {p}; restored its encrypted copy", file=sys.stderr)
+            elif is_encrypted(p):
+                unlink(kept)
+                pids.unlink(missing_ok=True)
+            else:
+                seal(p)
+    sys.exit(rc if rc >= 0 else 128 - rc)
+
+
+# ---------- scan: find secrets outside the store (names only, never values) ----------
+
+SCAN_SKIP = {".git", "node_modules", "target", "__pycache__", ".venv", "venv", "dist", "build", ".next", "vendor"}
+SCAN_PATTERNS = [
+    ("private-key", re.compile(rb"-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----")),
+    ("age-identity", re.compile(rb"AGE-SECRET-KEY-1[0-9A-Z]{50,}")),
+    ("aws-key", re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("gcp-service-account", re.compile(rb'"type":\s*"service_account"[\s\S]{0,4000}"private_key"')),
+    ("github-token", re.compile(rb"\b(?:gh[pousr]_[0-9A-Za-z]{30,}|github_pat_[0-9A-Za-z_]{30,})")),
+    ("gitlab-token", re.compile(rb"\bglpat-[0-9A-Za-z_-]{20}")),
+    ("slack-token", re.compile(rb"\bxox[abprs]-[0-9A-Za-z-]{10,}")),
+    ("api-key", re.compile(rb"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{30,}")),
+    ("stripe-live", re.compile(rb"\b[rs]k_live_[0-9A-Za-z]{20,}")),
+    ("url-credentials", re.compile(rb"\b[a-z][a-z0-9+.-]*://[^/\s:@'\"]+:[^/\s@'\"$]{6,}@")),
+    ("env-secret", re.compile(rb"(?m)^\s*(?:export\s+)?[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|TOKEN|API_KEY|APIKEY|PRIVATE_KEY)"
+                              rb"[A-Z0-9_]*\s*=\s*['\"]?[^\s'\"#$]{8,}")),
+]
+WALLET = re.compile(rb"^\s*\[\s*\d{1,3}(?:\s*,\s*\d{1,3}){63}\s*\]\s*$")  # a 64-byte JSON keypair (Solana style)
+
+
+def key_encrypted(data):
+    """PEM keys say so in a header; OpenSSH keys name their cipher inside the base64 body ("none" = plaintext)."""
+    if b"ENCRYPTED" in data[:200]:
+        return True
+    m = re.search(rb"-----BEGIN OPENSSH PRIVATE KEY-----\s+([A-Za-z0-9+/=\s]+?)-----END", data)
+    if not m:
+        return False
+    try:
+        body = base64.b64decode(re.sub(rb"\s+", b"", m.group(1)))
+        n = int.from_bytes(body[15:19], "big")
+        return body.startswith(b"openssh-key-v1\0") and body[19:19 + n] != b"none"
+    except ValueError:
+        return False
+
+
+def cmd_scan(a):
+    found = 0
+    roots = [Path(p).expanduser() for p in a.paths]
+    for root in roots:
+        walker = [(str(root.parent), [], [root.name])] if root.is_file() else os.walk(root)
+        for dp, dns, fns in walker:
+            dns[:] = [d for d in dns if d not in SCAN_SKIP]
+            if Path(dp).resolve() == ROOT or ROOT in Path(dp).resolve().parents:
+                dns[:] = []
+                continue
+            for fn in fns:
+                p = Path(dp) / fn
+                try:
+                    st = p.lstat()
+                    if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= a.max_size:
+                        continue
+                    data = p.read_bytes()
+                except OSError:
+                    continue
+                kinds = ["wallet-keypair"] if st.st_size < 2000 and WALLET.match(data) else []
+                if b"\0" not in data[:4096]:
+                    kinds += [k for k, rx in SCAN_PATTERNS if rx.search(data)]
+                if kinds[:1] == ["private-key"] and key_encrypted(data):
+                    kinds[0] = "private-key (passphrase)"
+                if kinds:
+                    found += 1
+                    print(f"{','.join(kinds)}\t{oct(stat.S_IMODE(st.st_mode))[2:]}\t{st.st_size}\t{p}")
+    print(f"{found} files look like they hold secrets", file=sys.stderr)
+
+
+# ---------- owner export: --show (JSON) and --dump (xlsx) ----------
+
+SHEET_NAMES = {KEYS: "Keys", CREDS: "Logins"}
+NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+NS_R = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+XML_BAD = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+CELL_MAX = 32767
+
+
+def windows_password_ok(password):
+    import ctypes
+    from ctypes import wintypes
+    adv = ctypes.WinDLL("advapi32")
+    adv.LogonUserW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                               ctypes.POINTER(wintypes.HANDLE)]
+    adv.LogonUserW.restype = wintypes.BOOL
+    for logon_type in (2, 3):  # interactive, then network
+        token = wintypes.HANDLE()
+        if adv.LogonUserW(USER_NAME, os.environ.get("USERDOMAIN", "."), password, logon_type, 0, ctypes.byref(token)):
+            ctypes.WinDLL("kernel32").CloseHandle(token)
+            return True
+    return False
+
+
+def owner_gate(flag):
+    """--show and --dump reveal every secret, so they ask for the owner's OS password first."""
+    if SUDO or os.environ.get("ELBAB_IDENTITY_FILE"):  # already under sudo, or tests
+        return
+    try:  # no terminal means no one to type the password; agents and scripts stop here
+        os.close(os.open("CONIN$" if WINDOWS else "/dev/tty", os.O_RDWR))
+    except OSError:
+        die(f"{flag} asks for your {'Windows' if WINDOWS else 'sudo'} password; run it in a terminal")
+    if WINDOWS:
+        if not windows_password_ok(getpass.getpass(f"elbab {flag}: Windows password for {USER_NAME}: ")):
+            die("password check failed; nothing exported")
+    elif subprocess.run([shutil.which("sudo") or die("sudo is not installed"), "-v", "-p",
+                         f"elbab {flag}: sudo password for %u: "]).returncode:
+        die("sudo check failed; nothing exported")
+
+
+def export_files(backups):
+    """Every decrypted file, keys.json and logins.csv first; old versions only with --backups."""
+    first = [KEYS, CREDS]
+    names = sorted((r[:-4] for _, r in tree() if r.endswith(".age")),
+                   key=lambda n: (n not in first, first.index(n) if n in first else 0, n))
+    files = {name: as_obj(name, read(name)) for name in names if backups or name.split("/")[0] != "backups"}
+    home = HOME.resolve()
+    for p in registered():  # files and folders encrypted in place, under their own paths
+        if is_encrypted(p):
+            name, data = f"~/{p.relative_to(home).as_posix()}" if home in p.parents else str(p), age_decrypt(p)
+            folder = as_folder(data)
+            files[name] = as_obj(name, data) if folder is None else {"folder": {
+                rel: text_or_base64(body) for rel, (kind, _, _, body) in sorted(folder.items()) if kind == "file"}}
+    return files
+
+
+def text_or_base64(data):
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"base64": base64.b64encode(data).decode()}
+
+
+def as_obj(name, data):
+    if name.endswith(".json"):
+        try:
+            return json.loads(data)
+        except ValueError:
+            pass
+    if name.endswith(".csv"):
+        return list(csv.DictReader(io.StringIO(data.decode("utf-8-sig"), newline="")))
+    body = text_or_base64(data)
+    return {"text": body} if isinstance(body, str) else body
+
+
+def show_json(files):
+    json.dump({"host": HOST, "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+               "files": files}, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    print(f"showed {len(files)} files", file=sys.stderr)
+
+
+def flatten(obj, prefix=""):
+    """Leaf values with elbab field paths (a/b/0/c)."""
+    if isinstance(obj, (dict, list)) and obj:
+        for k, v in (obj.items() if isinstance(obj, dict) else enumerate(obj)):
+            yield from flatten(v, f"{prefix}/{k}" if prefix else str(k))
+    else:
+        yield prefix, obj
+
+
+def sheet_rows(name, obj):
+    if name == KEYS:
+        entries = obj.get("entries", {})
+        extra = sorted({k for e in entries.values() for k in e} - {"provider", "scope", "credentials"})
+        rows = [["entry", "variable", "value", "provider", "scope", *extra]]
+        for n, e in entries.items():
+            for var, value in (e.get("credentials") or {"": ""}).items():
+                rows.append([n, var, value, e.get("provider"), e.get("scope"), *(e.get(k) for k in extra)])
+        return rows + [[]] + [[k, v] for k, v in obj.items() if k != "entries"]
+    if name.endswith(".csv") and isinstance(obj, list):
+        fields = list(obj[0]) if obj else []
+        return [fields] + [[r.get(f) for f in fields] for r in obj]
+    if isinstance(obj, dict) and list(obj) == ["folder"]:
+        return [["file", "contents"]] + [[rel, body if isinstance(body, str) else
+                                          f"binary, {len(base64.b64decode(body['base64']))} bytes; save the folder with: "
+                                          f"elbab decrypt {name} -o DIR"] for rel, body in obj["folder"].items()]
+    if not name.endswith(".json") and isinstance(obj, dict) and list(obj) == ["base64"]:
+        size = len(base64.b64decode(obj["base64"]))
+        how = f"elbab decrypt {name} -o FILE" if name.startswith(("~", "/")) or ":" in name else f"elbab cat {name} > FILE"
+        return [["binary file"], [f"{size} bytes; save it with: {how}"]]
+    if not name.endswith(".json") and isinstance(obj, dict) and list(obj) == ["text"]:
+        return [["text"]] + [[line] for line in obj["text"].splitlines()]
+    return [["path", "value"]] + [list(pair) for pair in flatten(obj)]
+
+
+def col_name(i):
+    name = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        name = chr(65 + r) + name
+    return name
+
+
+def cell_xml(ref, value, style):
+    text = "" if value is None else value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    text = XML_BAD.sub("", text)
+    if len(text) > CELL_MAX:
+        text = text[:CELL_MAX - 40] + " … [truncated; see elbab --show]"
+    return f'<c r="{ref}" t="inlineStr" s="{style}"><is><t xml:space="preserve">{escape(text)}</t></is></c>'
+
+
+def sheet_xml(rows):
+    widths = {}
+    for row in rows:
+        for i, v in enumerate(row):
+            widths[i] = min(max(widths.get(i, 8), len(v if isinstance(v, str) else json.dumps(v)) + 2), 60)
+    cols = "".join(f'<col min="{i + 1}" max="{i + 1}" width="{w}" customWidth="1"/>' for i, w in sorted(widths.items()))
+    body = "".join(f'<row r="{r + 1}">' + "".join(cell_xml(f"{col_name(c)}{r + 1}", v, int(r == 0))
+                                                for c, v in enumerate(row)) + "</row>" for r, row in enumerate(rows))
+    return (f'{XML_HEAD}<worksheet {NS}><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+            f'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+            f'{f"<cols>{cols}</cols>" if cols else ""}<sheetData>{body}</sheetData></worksheet>')
+
+
+def write_xlsx(path, sheets):
+    """A minimal stdlib workbook: inline strings only (so nothing is ever a formula), bold frozen header row."""
+    n = len(sheets)
+    types = "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/'
+                    f'vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, n + 1))
+    parts = {
+        "[Content_Types].xml": f'{XML_HEAD}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+            f'{types}</Types>',
+        "_rels/.rels": f'{XML_HEAD}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+        "xl/workbook.xml": f'{XML_HEAD}<workbook {NS} {NS_R}><sheets>' + "".join(
+            f'<sheet name="{escape(name, {chr(34): "&quot;"})}" sheetId="{i}" r:id="rId{i}"/>'
+            for i, (name, _) in enumerate(sheets, 1)) + "</sheets></workbook>",
+        "xl/_rels/workbook.xml.rels": f'{XML_HEAD}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            + "".join(f'<Relationship Id="rId{i}" Type="{REL}/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, n + 1))
+            + f'<Relationship Id="rId{n + 1}" Type="{REL}/styles" Target="styles.xml"/></Relationships>',
+        "xl/styles.xml": f'{XML_HEAD}<styleSheet {NS}><fonts count="2"><font><sz val="12"/><name val="Calibri"/></font>'
+            '<font><b/><sz val="12"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill>'
+            '<fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/>'
+            '<diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+            '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+            '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+            '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>',
+    }
+    parts.update({f"xl/worksheets/sheet{i}.xml": sheet_xml(rows) for i, (_, rows) in enumerate(sheets, 1)})
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    except FileExistsError:
+        die(f"{path} already exists")
+    with os.fdopen(fd, "wb") as fh, zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as z:
+        for part, xml in parts.items():
+            z.writestr(part, xml)
+
+
+def dump_xlsx(files, dest):
+    out = Path(dest).expanduser() if dest else HOME / "Downloads"
+    if not dest:
+        out.mkdir(mode=0o700, exist_ok=True)
+    if out.is_dir():
+        out /= f"elbab-{HOST}-{datetime.now():%Y%m%d-%H%M%S}.xlsx"
+    taken, sheets, contents = {"contents"}, [], [["file", "sheet", "rows"]]
+    for name, obj in files.items():
+        label = f"folder {Path(name).name}" if list(obj) == ["folder"] else Path(name).name if name.startswith(("~", "/")) or ":" in name else name
+        title = SHEET_NAMES.get(name) or re.sub(r"[\\/?*\[\]:]", "-", label).strip("'")[:31]
+        base, k = title, 2
+        while title.lower() in taken:
+            title, k = f"{base[:26]} ({k})", k + 1
+        taken.add(title.lower())
+        rows = sheet_rows(name, obj)
+        sheets.append((title, rows))
+        contents.append([name, title, str(len(rows) - 1)])
+    contents += [[], ["generated", datetime.now().astimezone().isoformat(timespec="seconds"), HOST]]
+    write_xlsx(out, [("Contents", contents)] + sheets)
+    print(out)
+    print(f"wrote {len(files)} files to one workbook; it is plaintext, so delete it when you are done", file=sys.stderr)
+
+
+# ---------- command line ----------
+
+def main():
+    if SUDO:
+        drop_root()
+    if sys.argv[1:2] == ["guard"] and len(sys.argv) > 2:  # every later argument belongs to the tool
+        guard_run(sys.argv[2], sys.argv[3:])
+    if sys.argv[1:2] in (["--show"], ["--dump"]):
+        flag = sys.argv[1]
+        e = argparse.ArgumentParser(prog=f"elbab {flag}", description="Owner only: export every secret. Asks for your OS password.")
+        if flag == "--dump":
+            e.add_argument("dest", nargs="?", help="an .xlsx path or a folder (default ~/Downloads)")
+        e.add_argument("--backups", action="store_true", help="also export the old versions kept in backups/")
+        a = e.parse_args(sys.argv[2:])
+        owner_gate(flag)
+        files = export_files(a.backups)
+        show_json(files) if flag == "--show" else dump_xlsx(files, a.dest)
+        return
+    p = argparse.ArgumentParser(prog="elbab", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def cmd(name, fn, *args, **kw):
+        s = sub.add_parser(name, **kw)
+        for flags, opts in args:
+            s.add_argument(*flags, **opts)
+        s.set_defaults(fn=fn)
+        return s
+
+    note = (["--note"], {"help": "encrypted note; replaces the previous note when supplied"})
+    scope = (["--scope"], {})
+    copy = (["--copy"], {"action": "store_true", "help": "to the clipboard, cleared after 30 s"})
+    hidden = (["--hidden"], {"action": "store_true", "help": "hide input instead of the default visible prompt"})
+
+    def shown(s):
+        g = s.add_mutually_exclusive_group()
+        g.add_argument("--mask", action="store_true", help="mask secrets even on a terminal")
+        g.add_argument("--reveal", action="store_true", help="show secrets even when piped")
+    cmd("init", cmd_init, (["--backend"], {"choices": list(BACKENDS)}),
+        (["--identity-file"], {"help": "use an existing identity file (e.g. a YubiKey plugin identity)"}),
+        (["--command"], {"help": "a command that prints the identity (e.g. a password manager CLI)"}),
+        (["--service"], {"default": KEYCHAIN_SERVICE, "help": "keychain and secret-service item name"}),
+        (["--access-control"], {"default": "none", "help": "secure-enclave only: none (default), passcode, any-biometry, ..."}),
+        (["--recovery"], {"metavar": "FILE", "help": "also create a recovery key there, for you to move offline"}),
+        (["--join"], {"action": "store_true", "help": "set up this machine for an existing store"}),
+        help="set up this machine's identity and, unless --join, a new store")
+    cmd("recipients", cmd_recipients, (["action"], {"nargs": "?", "choices": ["list", "add"], "default": "list"}),
+        (["recipient"], {"nargs": "?"}), (["--name"], {}))
+    cmd("list", cmd_list)
+    cmd("run", cmd_run, (["entry"], {}), (["command"], {"nargs": argparse.REMAINDER}))
+    cmd("get", cmd_get, (["entry"], {}), (["var"], {}), copy)
+    shown(cmd("show", cmd_show, (["file"], {}), (["path"], {"nargs": "?"})))
+    cmd("field", cmd_field, (["file"], {}), (["path"], {}), copy)
+    cmd("set", cmd_set, (["file"], {}), (["path"], {}), (["--json"], {"action": "store_true", "help": "parse the value as JSON"}), hidden)
+    cmd("set-key", cmd_set_key, (["entry"], {}), (["var"], {}), scope, note,
+        (["--default-scope"], {"help": "scope for a new entry only"}), (["--provider"], {}), (["--verification"], {}), hidden)
+    cmd("import-env", cmd_import_env, (["entry"], {}), (["file"], {}), scope, note)
+    s = cmd("save", cmd_save, (["name"], {"help": "credential label or login; stored under this exact name"}), scope, note,
+            help="store a permanent password; elbab NAME is shorthand")
+    prompt = s.add_mutually_exclusive_group()
+    prompt.add_argument("--hidden", dest="hidden", action="store_true", help="hide input")
+    prompt.add_argument("--visible", dest="hidden", action="store_false", help="show input (default; never shell history)")
+    s.set_defaults(hidden=False)
+    cmd("tmp", cmd_tmp, (["name"], {"help": "stored as tmp.NAME"}),
+        (["duration"], {"type": parse_duration, "help": "lifetime, e.g. 12d, 2h, 1m or 1h30m"}),
+        hidden, scope, note,
+        help="prompt for an expiring password, without putting it in shell history")
+    c = cmd("csv", cmd_csv)
+    cs = c.add_subparsers(dest="csv_cmd", required=True)
+    q = cs.add_parser("query")
+    q.add_argument("-a", "--any", help="TEXT in any non-secret column (case-insensitive)")
+    q.add_argument("-w", "--where", action="append", default=[], help="COL=TEXT, case-insensitive substring")
+    q.add_argument("-c", "--cols")
+    shown(q)
+    q.add_argument("--json", action="store_true")
+    g = cs.add_parser("get")
+    g.add_argument("record")
+    g.add_argument("column")
+    g.add_argument("--copy", action="store_true")
+    cs.add_parser("upsert")
+    cs.add_parser("columns")
+    cmd("cat", cmd_cat, (["file"], {}))
+    cmd("put", cmd_put, (["file"], {}))
+    for verb, fn, what in (("encrypt", cmd_encrypt, "an encrypted copy"), ("decrypt", cmd_decrypt, "a decrypted copy")):
+        cmd(verb, fn, (["path"], {}), (["-o", "--output"], {"metavar": "OUT", "help": f"write {what} to OUT (must not exist) "
+                                                              "instead of working in place"}),
+            help=f"{verb} a file or folder in place, or to OUT")
+    cmd("print", cmd_print, (["path"], {}), help="decrypted contents to stdout; a folder prints every file, in order")
+    cmd("migrate", cmd_migrate, (["--dry-run"], {"action": "store_true"}))
+    cmd("purge-plaintext", cmd_purge)
+    cmd("rekey", cmd_rekey)
+    cmd("verify", cmd_verify)
+    cmd("aws", cmd_aws, (["file"], {}), (["profile"], {"nargs": "?", "default": "default"}), help="credential_process helper")
+    cmd("aws-protect", cmd_aws_protect, (["files"], {"nargs": "+"}))
+    cmd("ssh-protect", cmd_ssh_protect, (["keys"], {"nargs": "+"}))
+    cmd("ssh-load", cmd_ssh_load, (["keys"], {"nargs": "*"}),
+        (["--keychain"], {"action": "store_true", "help": "also store each passphrase in the macOS Keychain"}),
+        (["--exact"], {"action": "store_true", "help": "leave the agent holding exactly these keys"}))
+    cmd("ssh-pass", cmd_ssh_pass, (["key"], {}), copy)
+    cmd("pubkeys", cmd_pubkeys, (["name"], {"nargs": "?"}), (["--list"], {"action": "store_true"}))
+    cmd("guard-seal", cmd_guard_seal, (["tool"], {}))
+    cmd("guard-add", cmd_guard_add, (["name"], {}),
+        (["--dir"], {"required": True, "help": "the tool's config folder, relative to home or absolute"}),
+        (["--files"], {"action": "append", "required": True, "help": "glob of a login file in that folder (repeat)"}),
+        (["--binary"], {"help": "program to run, if not NAME"}), (["--alias"], {"action": "append", "help": "other command names"}),
+        (["--env"], {"help": "variable that points the program at --dir"}))
+    cmd("shims", cmd_shims, help="write a shim per guarded command")
+    cmd("scan", cmd_scan, (["paths"], {"nargs": "+"}), (["--max-size"], {"type": int, "default": 2_000_000}))
+    args = sys.argv[1:]
+    if args and not args[0].startswith("-") and args[0] not in sub.choices:
+        args = ["save", *args]
+    a = p.parse_args(args)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

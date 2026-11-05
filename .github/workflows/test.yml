@@ -1,0 +1,30 @@
+name: test
+on: workflow_dispatch  # on demand only: gh workflow run test
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install age (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install age; else
+            curl -sSL https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz | tar xz
+            echo "$PWD/age" >> "$GITHUB_PATH"
+          fi
+      - name: Install age (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-windows-amd64.zip -OutFile age.zip
+          Expand-Archive age.zip -DestinationPath .
+          "$PWD\age" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - run: python -m unittest -v tests/test_elbab.py

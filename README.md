@@ -1,0 +1,81 @@
+# Secure Secret Management for Humans and Agents
+
+We live in an age where there is a game afoot. You are constantly being attacked, whether you know it or not. And your job is to play defense. Let's kick some ass.
+
+Etymology of ELBAB, for the curious: In Arabic (and sometimes borrowed in Hebrew), "Elbab Maftuch" literally means the door is open, and is an expression of warmth and open invitation to trusted friends and guests who are welcome in one's home.
+
+## Why
+
+Attackers rarely break encryption. They read what you left in plaintext: `~/.aws/credentials`, an SSH key with no passphrase, a `.env` in an old backup, or [a token in an agent's transcript](https://www.eweek.com/news/claude-ai-database-wipe/). elbab encrypts all of it in a simple way, keeps each machine's key in its OS vault or chip, and lets agents use credentials they never "see". For the curious, more about our process here: [Dreamers Inc. security](https://thedreamers.us/infosec/).
+
+## Install
+
+Needs Python 3.9+ and [age](https://github.com/FiloSottile/age) 1.2+.
+
+```sh
+git clone https://github.com/dreamers-laboratory/good-door && cd good-door
+install -m 755 bin/elbab ~/.local/bin/elbab     # Windows: put bin\elbab and bin\elbab.cmd on PATH
+elbab init --recovery ~/elbab-recovery.txt      # then move that file offline
+```
+
+## Where the key lives
+
+| OS | `init` option | Notes |
+|---|---|---|
+| macOS | `--backend keychain` (default) | login Keychain |
+| macOS | `--backend secure-enclave` | never leaves the chip; needs `age-plugin-se` |
+| Linux | `--backend tpm` (default with a TPM) | systemd-creds 256+; unsealed into RAM once per boot |
+| Linux | `--backend secret-service` | GNOME Keyring or KWallet via `secret-tool` |
+| Windows | `--backend dpapi` (default) | your Windows account |
+| any | `--identity-file PATH` | e.g. a YubiKey plugin identity |
+| any | `--command CMD` | any CLI that prints the key, e.g. a password manager |
+
+No prompts unless you set the hardware or password manager to ask.
+
+## Use
+
+```sh
+elbab set-key openai OPENAI_API_KEY      # prompts; never in shell history (--hidden: no echo)
+elbab run openai -- python app.py        # value in the environment, never in a file
+elbab get openai OPENAI_API_KEY --copy   # clipboard, cleared after 30 s
+elbab github.com                         # a password; "user / password" stores both
+elbab tmp wifi 2h                        # expires
+elbab list                               # names only
+elbab show keys.json                     # every value, on your own terminal
+```
+
+`show` and `csv query` print secrets only to your terminal. Pipes and agent shells (`CLAUDECODE`, `AI_AGENT`,
+`CODEX_THREAD_ID`, `CODEX_SHELL` or `CODEX_SANDBOX` set) get them masked; `--mask` masks them on screen too.
+
+`elbab --help` lists the rest.
+
+## Protect what's already on disk
+
+| Credential | Command | Afterwards |
+|---|---|---|
+| SSH keys | `elbab ssh-protect ~/.ssh/id_ed25519` | random passphrase; `elbab ssh-load` fills the agent |
+| AWS | `elbab aws-protect ~/.aws/credentials` | keyless file; AWS gets keys through `credential_process` |
+| gcloud, az | `elbab shims`, shims folder first on PATH, `elbab guard-seal gcloud` | login decrypted only while the CLI runs |
+| any CLI | `elbab guard-add kubectl --dir .kube --files config` | same |
+| any file or folder | `elbab encrypt ~/wallet` | one age file at the same path; `elbab run ~/wallet -- CMD` decrypts it only while CMD runs |
+| `.env` | `elbab import-env app .env && elbab encrypt .env` | `elbab run app -- npm start` |
+| unknown | `elbab scan ~/code` | names, never values |
+
+`elbab decrypt PATH` undoes `encrypt`, `elbab print PATH` writes to stdout, and `-o OUT` makes a copy instead (never overwrites). `run` takes a path when it has a slash or starts with `.` or `~`, and keeps the previous version in `backups/` if CMD changed anything. Plain `age -d` (plus `tar` for a folder) always recovers a file without elbab.
+
+SSH without prompts: macOS, add `UseKeychain yes` under `Host *` in `~/.ssh/config`. Headless Linux, use [`contrib/elbab-ssh-agent.service`](contrib/elbab-ssh-agent.service). Windows, start the `ssh-agent` service and run `elbab ssh-load` once.
+
+## Agents
+
+Give your agent [`skill/SKILL.md`](skill/SKILL.md). It runs commands with credentials and never sees them.
+
+## Limits
+
+- Anything running as you can call elbab. It protects copies (backups, sync, transcripts, other accounts), not a compromised account.
+- `encrypt` replaces originals, but SSDs can keep old blocks. Use full-disk encryption.
+- Files and folders: up to 256 MB, no links.
+- `--show` and `--dump` export everything after your OS password.
+
+## Test
+
+`python3 -m unittest -v tests/test_elbab.py`. CI on macOS, Linux and Windows runs on demand: `gh workflow run test`.
