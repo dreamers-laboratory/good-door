@@ -1,4 +1,4 @@
-# Secure Secret Management for Humans and Agents
+# Simple Secure Secret Management for Humans and Agents
 
 We live in an age where there is a game afoot. You are constantly being attacked, whether you know it or not. And your job is to play defense. Let's kick some ass.
 
