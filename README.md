@@ -2,8 +2,6 @@
 
 We live in an age where there is a game afoot. You are constantly being attacked, whether you know it or not. And your job is to play defense. Let's kick some ass.
 
-Etymology of ELBAB, for the curious: In Arabic (and sometimes borrowed in Hebrew), "Elbab Maftuch" literally means the door is open, and is an expression of warmth and open invitation to trusted friends and guests who are welcome in one's home.
-
 ## Why
 
 Attackers rarely break encryption. They read what you left in plaintext: `~/.aws/credentials`, an SSH key with no passphrase, a `.env` in an old backup, or [a token in an agent's transcript](https://www.eweek.com/news/claude-ai-database-wipe/). elbab encrypts all of it in a simple way, keeps each machine's key in its OS vault or chip, and lets agents use credentials they never "see". For the curious, more about our process here: [Dreamers Inc. security](https://thedreamers.us/infosec/).
@@ -86,3 +84,5 @@ Give your agent [`skill/SKILL.md`](skill/SKILL.md). It runs commands with creden
 ## Test
 
 `python3 -m unittest -v tests/test_elbab.py`. CI on macOS, Linux and Windows runs on demand: `gh workflow run test`.
+
+Etymology of ELBAB, for the curious: In Arabic (and sometimes borrowed in Hebrew), "Elbab Maftuch" literally means the door is open, and is an expression of warmth and open invitation to trusted friends and guests who are welcome in one's home.
