@@ -21,12 +21,12 @@ elbab init --recovery ~/elbab-recovery.txt      # then move that file offline
 | OS | `init` option | Notes |
 |---|---|---|
 | macOS | `--backend keychain` (default) | login Keychain |
-| macOS | `--backend secure-enclave` | never leaves the chip; needs `age-plugin-se` |
+| macOS | `--backend secure-enclave` | never leaves the chip; needs `age-plugin-se`; `--access-control passcode` asks for your Mac password at each use |
 | Linux | `--backend tpm` (default with a TPM) | systemd-creds 256+; unsealed into RAM once per boot |
 | Linux | `--backend secret-service` | GNOME Keyring or KWallet via `secret-tool` |
 | Windows | `--backend dpapi` (default) | your Windows account |
-| any | `--identity-file PATH` | e.g. a YubiKey plugin identity |
-| any | `--command CMD` | any CLI that prints the key, e.g. a password manager |
+| any | `--identity-file PATH` | e.g. a YubiKey plugin identity, which asks for a touch |
+| any | `--command CMD` | any CLI that prints the key, e.g. a password manager that asks |
 
 No prompts unless you set the hardware or password manager to ask.
 
@@ -77,7 +77,10 @@ Give your agent [`skill/SKILL.md`](skill/SKILL.md). It runs commands with creden
 
 ## Limits
 
-- Anything running as you can call elbab. It protects copies (backups, sync, transcripts, other accounts), not a compromised account.
+This is designed to protect against external attackers. With prompts on, even malware running as you, like [this one](https://cursor.com/blog/claude-code-extension-security-notice), can't unlock it on its own. It assumes a trusted agent, and doesn't protect against your agent going rogue at the dawn of the robot apocalypse.
+
+- The default favors convenience and ease of use, since we suspect most people wouldn't use the Fort Knox version: with no prompts, anything running as you can call elbab. For the strongest protection, choose a key that asks for a secret only you know at each use: the Secure Enclave with `--access-control passcode` on macOS, or on any OS a password manager or YubiKey set to ask for its password or PIN every time. That protects you from most attack vectors, as long as you have the secret written down or memorized.
+- Prompts don't cover secrets already in use: a running `elbab run` command or a loaded SSH agent.
 - `encrypt` replaces originals, but SSDs can keep old blocks. Use full-disk encryption.
 - Files and folders: up to 256 MB, no links.
 - `--show` and `--dump` export everything after your OS password.
