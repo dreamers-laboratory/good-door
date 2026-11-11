@@ -10,7 +10,7 @@ for a password. Decrypted data stays in memory, except `cat`, which streams to s
   elbab recipients [add AGE1... --name N]      machines and recovery keys that can decrypt; then rekey
   elbab list                                   entry names and scopes (no decryption)
   elbab run ENTRY [--] CMD...                  run CMD with ENTRY's variables in its environment
-  elbab print ENTRY [FIELD] [--copy]           one value, or all saved fields as JSON
+  elbab print ENTRY [FIELD] [--copy]           one value, or all saved fields as JSON; a miss lists close names
   elbab get ENTRY [FIELD] [--copy]             compatibility alias for entry values
   elbab set-key ENTRY VAR [--scope S]          store a value (visible prompt or stdin; --hidden)
   elbab NAME | save NAME                       store a password; "user / password" stores both (--hidden)
@@ -37,6 +37,7 @@ import base64
 import configparser
 import contextlib
 import csv
+import difflib
 import getpass
 import hashlib
 import io
@@ -107,11 +108,13 @@ def plaintext_ok(rel):
 
 
 SECRET_KEY = re.compile(r"pass(word|phrase|code)?$|secret|token|_?key$|api_?key|private|answer|^pin$|cookie|session", re.I)
-SECRET_VALUE = re.compile("|".join([
+SECRET_TOKENS = [
     r"sk-[A-Za-z0-9_-]{16,}", r"\bAKIA[0-9A-Z]{16}\b", r"AGE-SECRET-KEY-1[0-9A-Z]{50,}",
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----", r"\bxox[abprs]-[A-Za-z0-9-]{10,}",
-    r"\bgh[pousr]_[A-Za-z0-9]{30,}", r"\bgithub_pat_[A-Za-z0-9_]{30,}", r"\b[A-Za-z0-9_+=-]{40,}",
-]))
+    r"\bgh[pousr]_[A-Za-z0-9]{30,}", r"\bgithub_pat_[A-Za-z0-9_]{30,}",
+]
+SECRET_VALUE = re.compile("|".join([*SECRET_TOKENS, r"\b[A-Za-z0-9_+=-]{40,}"]))
+TOKEN_VALUE = re.compile("|".join(SECRET_TOKENS))  # path lists: long names and content digests are normal there
 MASK = "••••"
 COPY_CLEAR_SECONDS = 30
 
@@ -119,6 +122,36 @@ COPY_CLEAR_SECONDS = 30
 def die(msg, code=2):
     print(f"elbab: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def close_names(word, names):
+    """Every name in names ({shown: compared}) close to word, best first: another case, one
+    containing the other, or a similar spelling."""
+    w, score = word.lower(), {}
+    for shown, name in names.items():
+        low = name.lower()
+        s = difflib.SequenceMatcher(None, w, low).ratio() + (w in low or (len(low) >= 3 and low in w))
+        if s >= 0.6:
+            score[shown] = s
+    return sorted(score, key=lambda n: (-score[n], n))
+
+
+def no_match(msg, word, names, otherwise=""):
+    close = close_names(word, names)
+    die((f"{msg}; did you mean:\n" + "\n".join(f"  {n}" for n in close)) if close else msg + otherwise)
+
+
+def typed_dir(arg):
+    """The folder part of arg as typed, separator included ('' when it has none)."""
+    s = str(arg).rstrip("/\\")
+    return s[:max(s.rfind("/"), s.rfind("\\") if WINDOWS else -1) + 1]
+
+
+def names_in(folder, prefix):
+    try:
+        return {prefix + n: n for n in os.listdir(folder)}
+    except OSError:
+        return {}
 
 
 def secret_column(name):
@@ -703,20 +736,26 @@ def cmd_run(a):
         path_run(target(a.entry), command)
     entries = load_keys()["entries"]
     if a.entry not in entries:
-        die("unknown or expired entry; see elbab list (for a file or folder, give a path such as ./NAME)")
+        no_match(f"no entry {a.entry} (for a file or folder, give a path such as ./NAME)", a.entry,
+                 {**names_in(".", "./"), **{n: n for n in entries}}, "; see elbab list")
     env = {**os.environ, **entries[a.entry]["credentials"]}
     if WINDOWS:  # no exec on Windows; keep the exit code
         sys.exit(subprocess.run(command, env=env).returncode)
     os.execvpe(command[0], command, env)
 
 
-def cmd_get(a):
-    entry = load_keys()["entries"].get(a.entry) or die("unknown or expired entry; see elbab list")
+def cmd_get(a, files=None):
+    """files: names to suggest beside entries when there is no such entry (print's ./NAME)."""
+    entries = load_keys()["entries"]
+    if a.entry not in entries:
+        no_match(f"no entry {a.entry}", a.entry, {**(files or {}), **{n: n for n in entries}}, "; see elbab list")
+    entry = entries[a.entry]
     if a.var is None:
         emit(json.dumps(entry["credentials"], indent=2, ensure_ascii=False), a.copy)
         return
     if a.var not in entry["credentials"]:
-        die(f"{a.entry} has no {a.var}; it has {', '.join(entry['credentials'])}")
+        no_match(f"{a.entry} has no {a.var}", a.var, {k: k for k in entry["credentials"]},
+                 f"; it has {', '.join(entry['credentials'])}")
     emit(entry["credentials"][a.var], a.copy)
 
 
@@ -1052,7 +1091,8 @@ def cmd_verify(a):
             encrypted += 1
         elif plaintext_ok(rel):
             text = path.read_text(errors="replace")
-            if re.search(r"AGE-SECRET-KEY-1[0-9A-Z]{50,}", text) or (rel != "recipients.txt" and SECRET_VALUE.search(text)):
+            shape = TOKEN_VALUE if re.fullmatch(r"(ssh/keys|encrypted)-[^/]+\.txt", rel) else SECRET_VALUE
+            if re.search(r"AGE-SECRET-KEY-1[0-9A-Z]{50,}", text) or (rel != "recipients.txt" and shape.search(text)):
                 problems.append(f"{rel} contains something that looks like a secret")
         elif path.name != ".DS_Store":
             problems.append(f"plaintext file {rel}")
@@ -1582,7 +1622,7 @@ def target(arg, new=False):
         if p.is_symlink() or getattr(p, "is_junction", lambda: False)():
             die(f"{p} is a link; give the path it points to")
         if not p.exists():
-            die(f"{p} does not exist")
+            no_match(f"{p} does not exist", p.name, names_in(p.parent, typed_dir(arg)))
         p = p.resolve()
     if p == ROOT or ROOT in p.parents or p in ROOT.parents:
         die(f"{p} overlaps the store; files there are managed with elbab put and elbab cat")
@@ -1863,7 +1903,7 @@ def cmd_print(a):
     if a.var is not None or not ("/" in a.path or "\\" in a.path or a.path.startswith((".", "~"))
                                   or os.path.lexists(os.path.expanduser(a.path))):
         a.entry = a.path
-        return cmd_get(a)
+        return cmd_get(a, names_in(".", "./") if a.var is None else None)
     if a.copy:
         die("--copy applies to entries, not files or folders")
     p = target(a.path)

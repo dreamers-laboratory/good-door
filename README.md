@@ -35,9 +35,10 @@ No prompts unless you set the hardware or password manager to ask.
 ```sh
 elbab set-key openai OPENAI_API_KEY      # prompts; never in shell history (--hidden: no echo)
 elbab run openai -- python app.py        # value in the environment, never in a file
-elbab print openai                      # all saved fields as JSON
+elbab print openai                       # all saved fields as JSON
 elbab print openai OPENAI_API_KEY        # one value
 elbab print openai OPENAI_API_KEY --copy # clipboard, cleared after 30 s
+elbab print opnai                        # no match: "did you mean" with every close name
 elbab github.com                         # a password; "user / password" stores both
 elbab tmp wifi 2h                        # expires
 elbab list                               # names only

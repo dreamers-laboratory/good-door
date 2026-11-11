@@ -541,6 +541,45 @@ class StoreTest(Base):
         self.assertIn("['new.txt', 'new\\n']", r.stdout, r.stderr)
         self.e("verify")
 
+    def test_3u_did_you_mean(self):
+        for name in ("suggest.alpha", "suggest.beta"):
+            self.e("set-key", name, "TOKEN", stdin="suggest-dummy-value")
+        def miss(*args, cwd=None):
+            r = subprocess.run([sys.executable, "-I", str(ELBAB), *args], env=self.env, cwd=cwd,
+                               capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(r.returncode, 0, args)
+            self.assertNotIn("suggest-dummy-value", r.stdout + r.stderr)
+            return r.stderr
+        err = miss("print", "sugest.alpha")
+        self.assertIn("did you mean:\n  suggest.alpha", err)  # best first
+        self.assertIn("  suggest.beta", err)  # every close name
+        err = miss("print", "SUGGEST")  # another case, contained in a longer name
+        self.assertIn("  suggest.alpha\n", err)
+        self.assertIn("  suggest.beta\n", err)
+        self.assertIn("did you mean:\n  TOKEN", miss("print", "suggest.alpha", "TOKN"))
+        self.assertIn("did you mean:\n  suggest.alpha", miss("get", "suggest.alfa", "TOKEN"))
+        self.assertIn("did you mean:\n  suggest.alpha", miss("run", "suggest.alfa", "--", "true"))
+        err = miss("print", "qqqzzzxxx")
+        self.assertNotIn("did you mean", err)
+        self.assertIn("see elbab list", err)
+        d = self.base / "suggest-files"
+        d.mkdir()
+        (d / "notes.txt").write_text("plain")
+        self.assertIn(f"did you mean:\n  {d}/notes.txt", miss("print", f"{d}/note.txt"))
+        self.assertIn(f"did you mean:\n  {d}/notes.txt", miss("encrypt", f"{d}/notes.tx"))
+        self.assertIn("did you mean:\n  ./notes.txt", miss("print", "notes.tx", cwd=d))
+        self.assertIn("did you mean:\n  ./notes.txt", miss("print", "./notes.tx", cwd=d))
+
+    def test_3v_path_list_digests(self):
+        f = self.root / "encrypted-otherhost.txt"  # paths only: long names and sha256 blob names are normal
+        f.write_text(f"/x/blobs/{'ab12' * 16}.gz\n/x/{'-'.join(['descriptive'] * 6)}.json\n")
+        try:
+            self.e("verify")
+            f.write_text("/x/sk-" + "A" * 30 + ".txt\n")  # a real token shape still fails
+            self.assertNotEqual(self.e("verify", ok=False).returncode, 0)
+        finally:
+            f.unlink()
+
     def test_4_tmp_durations(self):
         for duration, seconds in (("12d", 1036800), ("2h", 7200), ("1m", 60), ("1h30m", 5400), ("1W", 604800)):
             name = "duration-" + duration.lower()
