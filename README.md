@@ -1,6 +1,6 @@
 # Simple Secure Secret Management for Humans and Agents
 
-We live in an age where there is a game afoot. You are constantly being attacked, whether you know it or not. And your job is to play defense. Let's kick some ass.
+We live in an age where there is a game afoot, even though you never agreed to play. You are constantly being attacked, whether you know it or not. And your job is to play defense. So let's kick some ass.
 
 ## Why
 
