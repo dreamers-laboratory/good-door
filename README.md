@@ -4,7 +4,7 @@ We live in an age where there is a game afoot, even though you never agreed to p
 
 ## Why
 
-Attackers rarely break encryption. They read what you left in plaintext: `~/.aws/credentials`, an SSH key with no passphrase, a `.env` in an old backup, or [a token in an agent's transcript](https://www.eweek.com/news/claude-ai-database-wipe/). elbab encrypts all of it in a simple way, keeps each machine's key in its OS vault or chip, and lets agents use credentials they never "see". For the curious, more about our process here: [Dreamers Inc. security](https://thedreamers.us/infosec/).
+Attackers rarely break encryption. They read what you left in plaintext: `~/.aws/credentials`, an SSH key with no passphrase, a `.env` in an old backup, or [a token in an agent's transcript](https://www.eweek.com/news/claude-ai-database-wipe/). elbab encrypts all of it in a simple way, keeps each machine's key in its OS vault or chip, and lets agents use credentials they never "see".
 
 ## Install
 
@@ -88,5 +88,7 @@ This is designed to protect against external attackers. With prompts on, even ma
 ## Test
 
 `python3 -m unittest -v tests/test_elbab.py`. CI on macOS, Linux and Windows runs on demand: `gh workflow run test`.
+
+More about our process: [AI security and red teaming at Dreamers](https://thedreamers.us/ai/ai-security/).
 
 Etymology of ELBAB, for the curious: In Arabic (and sometimes borrowed in Hebrew), "Elbab Maftuch" literally means the door is open, and is an expression of warmth and open invitation to trusted friends and guests who are welcome in one's home.
